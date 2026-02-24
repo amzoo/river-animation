@@ -1,5 +1,7 @@
 const canvas = document.getElementById('canvas');
 const ctx = canvas.getContext('2d');
+const overlayCanvas = document.getElementById('overlay');
+const overlayCtx = overlayCanvas.getContext('2d');
 
 let width, height;
 let particles = [];
@@ -101,6 +103,8 @@ function resize() {
     height = window.innerHeight;
     canvas.width = width;
     canvas.height = height;
+    overlayCanvas.width = width;
+    overlayCanvas.height = height;
 
     cols = Math.ceil(width / GRID_SIZE);
     rows = Math.ceil(height / GRID_SIZE);
@@ -364,13 +368,14 @@ function animate() {
         particles[i].draw();
     }
 
-    // Debug overlay: dotted lines at vertical region boundaries
+    // Debug overlay: dotted lines at vertical region boundaries (drawn on separate canvas)
+    overlayCtx.clearRect(0, 0, width, height);
     if (debugOverlay) {
-        ctx.save();
-        ctx.setLineDash([8, 6]);
-        ctx.lineWidth = 1;
-        ctx.font = '12px monospace';
-        ctx.textBaseline = 'top';
+        overlayCtx.save();
+        overlayCtx.setLineDash([8, 6]);
+        overlayCtx.lineWidth = 1;
+        overlayCtx.font = '12px monospace';
+        overlayCtx.textBaseline = 'top';
 
         const regions = [
             { y: 0,              label: 'Spawn boundary (y=0)',        color: '#ff4444' },
@@ -380,16 +385,16 @@ function animate() {
         ];
 
         for (const r of regions) {
-            ctx.strokeStyle = r.color;
-            ctx.fillStyle = r.color;
-            ctx.beginPath();
-            ctx.moveTo(0, r.y);
-            ctx.lineTo(width, r.y);
-            ctx.stroke();
-            ctx.fillText(r.label, 8, r.y + 4);
+            overlayCtx.strokeStyle = r.color;
+            overlayCtx.fillStyle = r.color;
+            overlayCtx.beginPath();
+            overlayCtx.moveTo(0, r.y);
+            overlayCtx.lineTo(width, r.y);
+            overlayCtx.stroke();
+            overlayCtx.fillText(r.label, 8, r.y + 4);
         }
 
-        ctx.restore();
+        overlayCtx.restore();
     }
 
     // Slowly evolve the noise for shifting rivers

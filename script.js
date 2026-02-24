@@ -79,11 +79,11 @@ const FADE_FAST_AMOUNT = 3;
 
 // --- Zone Boundaries ---
 const DELTA_ZONE_END = 0.30;
-const TRANSITION_ZONE_END = 0.45;
+const TRANSITION_ZONE_END = 0.40;
 
 // --- Capillary System ---
 const CAPILLARY_FRACTION = 0.06;
-const CAPILLARY_ORIGIN_START = DELTA_ZONE_END + 0.75 * (TRANSITION_ZONE_END - DELTA_ZONE_END);
+const CAPILLARY_ORIGIN_START = TRANSITION_ZONE_END;
 const CAPILLARY_ORIGIN_SPACING_MIN = 0.10;
 const CAPILLARY_ORIGIN_SPACING_MAX = 0.15;
 const CAPILLARY_SPAWN_WETNESS = 5.0;
@@ -95,6 +95,7 @@ const CAPILLARY_MAX_RADIUS = 1.0;
 const CAPILLARY_PHEROMONE_DEPOSIT = 0.4;
 const CAPILLARY_PHEROMONE_ATTRACT = 0.15;
 const CAPILLARY_PHEROMONE_EVAP = 0.997;
+const CAPILLARY_REPULSE_STRENGTH = 0.3;
 // ==========================================
 
 let mouse = { x: 0, y: 0, prevX: 0, prevY: 0, frameDX: 0, frameDY: 0, dirX: 0, dirY: 1, targetDirX: 0, targetDirY: 1, speed: 0, active: false, middleDown: false, lastTime: 0 };
@@ -108,7 +109,9 @@ let cols, rows;
 let wetnessGrid;
 let erosionGrid;
 let capillaryGrid;
-let capillaryOrigins = [];
+let trackedRivers = [];   // Array of { id, color, centerCol, origins: [{ yPixel, yRow }], dead }
+let nextRiverId = 0;
+let riverTrackFrame = 0;  // Frame counter for throttling origin growth checks
 
 const simplex = new SimplexNoise();
 
@@ -157,49 +160,180 @@ function resize() {
 window.addEventListener('resize', resize);
 resize();
 
-function generateCapillaryOrigins() {
-    capillaryOrigins = [];
-    let y = CAPILLARY_ORIGIN_START * height;
-    while (y < height - 20) {
-        let row = Math.floor(y / GRID_SIZE);
-        if (row >= 0 && row < rows) {
-            capillaryOrigins.push({ yPixel: y, yRow: row });
-        }
-        let spacing = (CAPILLARY_ORIGIN_SPACING_MIN + Math.random() * (CAPILLARY_ORIGIN_SPACING_MAX - CAPILLARY_ORIGIN_SPACING_MIN)) * height;
-        y += spacing;
-    }
-}
+const RIVER_COLORS = [[0,204,204],[204,68,255],[68,255,204],[255,204,68],[255,68,204],[68,136,255],[255,136,68],[136,255,68]];
+const RIVER_MATCH_TOLERANCE = 15; // cells
 
-function findRiversAtRow(gridRow) {
-    if (gridRow < 0 || gridRow >= rows) return [];
-    let runs = [];
-    let inRun = false;
-    let runStart = 0;
-    for (let c = 0; c < cols; c++) {
-        let w = wetnessGrid[c + gridRow * cols];
-        if (w >= CAPILLARY_SPAWN_WETNESS) {
-            if (!inRun) { inRun = true; runStart = c; }
-        } else {
-            if (inRun) {
-                runs.push({ leftCol: runStart, rightCol: c - 1 });
-                inRun = false;
+function updateTrackedRivers() {
+    riverTrackFrame++;
+    let detectionY = CAPILLARY_ORIGIN_START * height;
+    let detectionRow = Math.floor(detectionY / GRID_SIZE);
+
+    // --- Detection line scan: find rivers crossing the detection row ---
+    let rivers = findRiversAtBand(detectionRow);
+
+    // --- Match detected rivers to existing tracked rivers ---
+    let matched = new Set();       // indices into rivers[]
+    let riverToTracked = new Map(); // river index -> tracked river
+
+    // Snapshot length to avoid iterating over newly-pushed merged rivers
+    let snapshotLen = trackedRivers.length;
+    for (let ti = 0; ti < snapshotLen; ti++) {
+        let tr = trackedRivers[ti];
+        if (tr.dead) continue;
+        let bestDist = Infinity;
+        let bestIdx = -1;
+        for (let i = 0; i < rivers.length; i++) {
+            let d = Math.abs(rivers[i].centerCol - tr.centerCol);
+            if (d < bestDist) { bestDist = d; bestIdx = i; }
+        }
+        if (bestIdx >= 0 && bestDist < RIVER_MATCH_TOLERANCE) {
+            tr.missedFrames = 0;
+            // Check for merge: is another tracked river already matched to this same wet run?
+            if (riverToTracked.has(bestIdx)) {
+                // Merge: two tracked rivers match the same detected run
+                let otherTr = riverToTracked.get(bestIdx);
+                let mergedRiver = {
+                    id: nextRiverId++,
+                    color: RIVER_COLORS[nextRiverId % RIVER_COLORS.length],
+                    centerCol: rivers[bestIdx].centerCol,
+                    origins: [...otherTr.origins, ...tr.origins],
+                    dead: false,
+                    missedFrames: 0
+                };
+                tr.dead = true;
+                otherTr.dead = true;
+                trackedRivers.push(mergedRiver);
+                riverToTracked.set(bestIdx, mergedRiver);
+            } else {
+                tr.centerCol = rivers[bestIdx].centerCol;
+                matched.add(bestIdx);
+                riverToTracked.set(bestIdx, tr);
             }
         }
     }
-    if (inRun) runs.push({ leftCol: runStart, rightCol: cols - 1 });
+
+    // --- Staleness: increment missed frames for unmatched rivers, mark dead ---
+    let matchedTracked = new Set();
+    for (let [, tr] of riverToTracked) matchedTracked.add(tr);
+    for (let ti = 0; ti < snapshotLen; ti++) {
+        let tr = trackedRivers[ti];
+        if (tr.dead || matchedTracked.has(tr)) continue;
+        tr.missedFrames = (tr.missedFrames || 0) + 1;
+        if (tr.missedFrames > 120) tr.dead = true;
+    }
+
+    // Periodically prune dead entries to prevent unbounded array growth
+    if (riverTrackFrame % 300 === 0) {
+        trackedRivers = trackedRivers.filter(tr => !tr.dead);
+    }
+
+    // --- Create new tracked rivers for unmatched detected runs ---
+    for (let i = 0; i < rivers.length; i++) {
+        if (matched.has(i) || riverToTracked.has(i)) continue;
+        // Need at least 2 rivers detected to spawn capillaries between them
+        let id = nextRiverId++;
+        let startY = detectionY;
+        let firstOrigin = { yPixel: startY, yRow: detectionRow };
+        trackedRivers.push({
+            id: id,
+            color: RIVER_COLORS[id % RIVER_COLORS.length],
+            centerCol: rivers[i].centerCol,
+            origins: [firstOrigin],
+            dead: false,
+            missedFrames: 0
+        });
+    }
+
+    // --- Origin growth: extend origins downward as rivers grow (throttled) ---
+    if (riverTrackFrame % 60 === 0) {
+        let growLen = trackedRivers.length;
+        for (let gi = 0; gi < growLen; gi++) {
+            let tr = trackedRivers[gi];
+            if (tr.dead) continue;
+            // Prune origins where the river is no longer detected
+            tr.origins = tr.origins.filter(o => {
+                let bandsAtOrigin = findRiversAtBand(o.yRow);
+                for (let rv of bandsAtOrigin) {
+                    if (Math.abs(rv.centerCol - tr.centerCol) < RIVER_MATCH_TOLERANCE) return true;
+                }
+                return false;
+            });
+            // Find the lowest existing origin
+            let lowestY = -Infinity;
+            for (let o of tr.origins) {
+                if (o.yPixel > lowestY) lowestY = o.yPixel;
+            }
+            // Scan downward from lowest origin to find how far the river extends
+            let maxExtentY = lowestY;
+            let scanRow = Math.floor(lowestY / GRID_SIZE);
+            for (let r = scanRow; r < rows; r++) {
+                let riversAtRow = findRiversAtBand(r);
+                let found = false;
+                for (let rv of riversAtRow) {
+                    if (Math.abs(rv.centerCol - tr.centerCol) < RIVER_MATCH_TOLERANCE) {
+                        maxExtentY = r * GRID_SIZE;
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found) break;
+            }
+            // Add new origins if river extends far enough below lowest origin
+            let spacingThreshold = CAPILLARY_ORIGIN_SPACING_MAX * height;
+            while (maxExtentY - lowestY > spacingThreshold) {
+                let spacing = (CAPILLARY_ORIGIN_SPACING_MIN + Math.random() * (CAPILLARY_ORIGIN_SPACING_MAX - CAPILLARY_ORIGIN_SPACING_MIN)) * height;
+                let newY = lowestY + spacing;
+                if (newY > height - 20) break;
+                let newRow = Math.floor(newY / GRID_SIZE);
+                tr.origins.push({ yPixel: newY, yRow: newRow });
+                lowestY = newY;
+            }
+        }
+    }
+}
+
+const RIVER_BAND_HALF = 5;           // rows above/below detection line
+const RIVER_EROSION_THRESHOLD = 15.0; // min erosion to count as river
+const RIVER_MIN_WIDTH = 3;           // cells — filter out noise/spray
+
+function findRiversAtBand(centerRow) {
+    if (centerRow < 0 || centerRow >= rows) return [];
+    let rMin = Math.max(0, centerRow - RIVER_BAND_HALF);
+    let rMax = Math.min(rows - 1, centerRow + RIVER_BAND_HALF);
+
+    // Build per-column max erosion across band
+    let profile = new Float32Array(cols);
+    for (let r = rMin; r <= rMax; r++) {
+        let offset = r * cols;
+        for (let c = 0; c < cols; c++) {
+            let e = erosionGrid[c + offset];
+            if (e > profile[c]) profile[c] = e;
+        }
+    }
+
+    // Find runs above threshold
+    let runs = [];
+    let inRun = false, runStart = 0;
+    for (let c = 0; c < cols; c++) {
+        if (profile[c] >= RIVER_EROSION_THRESHOLD) {
+            if (!inRun) { inRun = true; runStart = c; }
+        } else {
+            if (inRun) { runs.push({leftCol: runStart, rightCol: c - 1}); inRun = false; }
+        }
+    }
+    if (inRun) runs.push({leftCol: runStart, rightCol: cols - 1});
 
     // Merge runs with < 3 cell gap
     let merged = [];
-    for (let i = 0; i < runs.length; i++) {
-        if (merged.length > 0 && runs[i].leftCol - merged[merged.length - 1].rightCol < 3) {
-            merged[merged.length - 1].rightCol = runs[i].rightCol;
+    for (let r of runs) {
+        if (merged.length > 0 && r.leftCol - merged[merged.length - 1].rightCol < 3) {
+            merged[merged.length - 1].rightCol = r.rightCol;
         } else {
-            merged.push({ ...runs[i] });
+            merged.push({...r});
         }
     }
-    for (let r of merged) {
-        r.centerCol = Math.floor((r.leftCol + r.rightCol) / 2);
-    }
+    merged = merged.filter(r => (r.rightCol - r.leftCol + 1) >= RIVER_MIN_WIDTH);
+    for (let r of merged) r.centerCol = Math.floor((r.leftCol + r.rightCol) / 2);
     return merged;
 }
 
@@ -433,21 +567,30 @@ class Particle {
     }
 
     _resetCapillary() {
-        if (capillaryOrigins.length === 0) { this._parkCapillary(); return; }
+        // Filter to live tracked rivers with at least 1 origin
+        let liveRivers = trackedRivers.filter(r => !r.dead && r.origins.length > 0);
+        if (liveRivers.length < 2) { this._parkCapillary(); return; }
         for (let attempt = 0; attempt < 5; attempt++) {
-            let origin = capillaryOrigins[Math.floor(Math.random() * capillaryOrigins.length)];
-            let rivers = findRiversAtRow(origin.yRow);
+            let river = liveRivers[Math.floor(Math.random() * liveRivers.length)];
+            let origin = river.origins[Math.floor(Math.random() * river.origins.length)];
+            let rivers = findRiversAtBand(origin.yRow);
             if (rivers.length < 2) continue;
-            let ri = Math.floor(Math.random() * rivers.length);
-            let river = rivers[ri];
+            // Find the river closest to this tracked river's centerCol
+            let bestDist = Infinity;
+            let matchedRiver = rivers[0];
+            for (let rv of rivers) {
+                let d = Math.abs(rv.centerCol - river.centerCol);
+                if (d < bestDist) { bestDist = d; matchedRiver = rv; }
+            }
             let dir = Math.random() < 0.5 ? -1 : 1;
-            let edgeCol = dir > 0 ? river.rightCol + 1 : river.leftCol - 1;
+            let edgeCol = dir > 0 ? matchedRiver.rightCol + 1 : matchedRiver.leftCol - 1;
             this.x = edgeCol * GRID_SIZE + Math.random() * GRID_SIZE;
             this.y = origin.yPixel + (Math.random() - 0.5) * GRID_SIZE * 2;
             this.vx = 0;
             this.vy = 0;
             this.age = 0;
             this.capillaryDir = dir;
+            this.capillaryRiverId = river.id;
             this.originRow = origin.yRow;
             this.spawnY = this.y;
             this.drawOpacity = 0;
@@ -543,6 +686,16 @@ class Particle {
                 forceY += pheroY * CAPILLARY_PHEROMONE_ATTRACT;
             }
 
+            // Capillary-capillary repulsion: push away from nearby pheromone vertically
+            let repulseY = 0;
+            for (let s = 1; s <= 8; s++) {
+                let invDist = 1.0 / (s * s);
+                let above = (r - s >= 0) ? capillaryGrid[c + (r - s) * cols] : 0;
+                let below = (r + s < rows) ? capillaryGrid[c + (r + s) * cols] : 0;
+                repulseY += (above - below) * invDist;
+            }
+            forceY -= repulseY * CAPILLARY_REPULSE_STRENGTH;
+
             // Arrival detection: reached another river below spawn point?
             if (!this.fadingOut && this.age > 30 && this.y > this.spawnY && wetnessGrid[idx] >= CAPILLARY_TARGET_WETNESS) {
                 // Check we're not still near our origin river
@@ -625,7 +778,11 @@ class Particle {
         if (this.drawOpacity <= MIN_DRAW_OPACITY) return;
 
         if (this.isCapillary && debugOverlay) {
-            ctx.fillStyle = `rgba(255, 80, 80, ${this.drawOpacity})`;
+            let cc = [255,255,255];
+            for (let tr of trackedRivers) {
+                if (tr.id === this.capillaryRiverId) { cc = tr.color; break; }
+            }
+            ctx.fillStyle = `rgba(${cc[0]}, ${cc[1]}, ${cc[2]}, ${this.drawOpacity})`;
         } else {
             ctx.fillStyle = `rgba(255, 255, 255, ${this.drawOpacity})`;
         }
@@ -659,7 +816,6 @@ for (let i = 0; i < NUM_PARTICLES; i++) {
     }
     particles.push(p);
 }
-generateCapillaryOrigins();
 
 function animate() {
     // Evaporate wetness grid and slowly decay erosion
@@ -669,6 +825,8 @@ function animate() {
         capillaryGrid[k] *= CAPILLARY_PHEROMONE_EVAP;
     }
 
+    // Dynamically track rivers and grow capillary origins
+    updateTrackedRivers();
 
     // Instead of using fillRect with a very low opacity (which gets stuck  
     // before true black due to browser 8-bit color rounding), we manually 
@@ -790,28 +948,40 @@ function animate() {
             overlayCtx.fillText('Push pill (100x20)', mouse.x + halfLength + 15, mouse.y - 5);
         }
 
-        // Capillary origin lines
-        for (let oi = 0; oi < capillaryOrigins.length; oi++) {
-            let origin = capillaryOrigins[oi];
-            overlayCtx.strokeStyle = '#00cccc';
-            overlayCtx.setLineDash([4, 8]);
-            overlayCtx.lineWidth = 1;
-            overlayCtx.beginPath();
-            overlayCtx.moveTo(0, origin.yPixel);
-            overlayCtx.lineTo(width, origin.yPixel);
-            overlayCtx.stroke();
-            overlayCtx.fillStyle = '#00cccc';
-            overlayCtx.fillText(`Cap ${oi}`, 8, origin.yPixel - 4);
+        // Detection line
+        let detectionY = CAPILLARY_ORIGIN_START * height;
+        overlayCtx.setLineDash([]);
+        overlayCtx.strokeStyle = '#ff8800';
+        overlayCtx.lineWidth = 2;
+        overlayCtx.beginPath();
+        overlayCtx.moveTo(0, detectionY);
+        overlayCtx.lineTo(width, detectionY);
+        overlayCtx.stroke();
+        overlayCtx.fillStyle = '#ff8800';
+        overlayCtx.fillText(`River detection line (${(CAPILLARY_ORIGIN_START * 100).toFixed(0)}%)`, 8, detectionY - 8);
 
-            // Mark detected rivers at this row
-            let rivers = findRiversAtRow(origin.yRow);
-            for (let rv of rivers) {
-                let cx = rv.centerCol * GRID_SIZE;
-                overlayCtx.beginPath();
-                overlayCtx.arc(cx, origin.yPixel, 4, 0, Math.PI * 2);
-                overlayCtx.fillStyle = 'rgba(0, 204, 204, 0.6)';
-                overlayCtx.fill();
+        // Capillary origin markers (per tracked river)
+        for (let tr of trackedRivers) {
+            if (tr.dead) continue;
+            let c = tr.color;
+            let colorStr = `rgb(${c[0]}, ${c[1]}, ${c[2]})`;
+            overlayCtx.strokeStyle = colorStr;
+            overlayCtx.setLineDash([]);
+            overlayCtx.lineWidth = 1;
+            for (let origin of tr.origins) {
+                let rivers = findRiversAtBand(origin.yRow);
+                for (let rv of rivers) {
+                    if (Math.abs(rv.centerCol - tr.centerCol) < RIVER_MATCH_TOLERANCE) {
+                        let cx = rv.centerCol * GRID_SIZE;
+                        overlayCtx.beginPath();
+                        overlayCtx.arc(cx, origin.yPixel, 8, 0, Math.PI * 2);
+                        overlayCtx.stroke();
+                    }
+                }
             }
+            // Label the river at its centerCol on the detection line
+            overlayCtx.fillStyle = colorStr;
+            overlayCtx.fillText(`R${tr.id}`, tr.centerCol * GRID_SIZE - 5, detectionY + 14);
         }
 
         overlayCtx.restore();

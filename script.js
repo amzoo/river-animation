@@ -11,6 +11,8 @@ let sourcePoints = [];
 // --- Overall Simulation ---
 // Number of particles spawned in the simulation
 const NUM_PARTICLES = 16000;
+// Fraction of particles dedicated to the delta zone (reset when they leave it)
+const SOURCE_PARTICLE_FRACTION = 0.25;
 
 // --- Flow Field & Noise ---
 // How zoomed in the noise field is. Smaller = broader rivers
@@ -133,6 +135,8 @@ class Particle {
         const src = sourcePoints[Math.floor(Math.random() * sourcePoints.length)];
         this.x = src + (Math.random() - 0.5) * 120;
         this.y = -Math.random() * 30;
+        // Reset age for source particles so they stay fresh
+        if (this.isSource) this.age = 0;
         this.vx = 0;
         this.vy = 0;
         this.speed = Math.random() * PARTICLE_SPEED_VAR + PARTICLE_SPEED_BASE;
@@ -240,12 +244,18 @@ class Particle {
         this.x += this.vx;
         this.y += this.vy;
 
+        // Source particles are confined to the delta zone — reset when they leave
+        if (this.isSource && this.y > height * 0.2) {
+            this.reset();
+            return;
+        }
+
         // Fluid characteristics:
         // Particles near the top (delta zone) are always visible and don't decay fast,
         // even when spread thin, so deltas can form before streams converge
         let inDelta = this.y > 0 && this.y < height * 0.2;
         let inStream = cellWetness >= WETNESS_DRY_THRESHOLD;
-        if (!inStream && !inDelta) {
+        if (!inStream && !inDelta && !this.isSource) {
             this.age += 4; // Small stray strands dry up / get absorbed rapidly
             // Fade out based on age — stray particles become invisible over time
             let ageFade = 1.0 - Math.min(this.age / (this.life * 0.3), 1.0);
@@ -284,8 +294,11 @@ class Particle {
     }
 }
 
+const SOURCE_COUNT = Math.floor(NUM_PARTICLES * SOURCE_PARTICLE_FRACTION);
 for (let i = 0; i < NUM_PARTICLES; i++) {
-    particles.push(new Particle());
+    let p = new Particle();
+    p.isSource = i < SOURCE_COUNT;
+    particles.push(p);
 }
 
 function animate() {

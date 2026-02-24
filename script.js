@@ -186,7 +186,7 @@ class Particle {
             // Scan laterally for nearby wet channels and pull toward the strongest one.
             // Larger channels (higher wetness+erosion) pull from further away,
             // causing small parallel streams to merge into dominant rivers.
-            let convergeFactor = Math.min(this.y / (height * 0.15), 1.0);
+            let convergeFactor = Math.min(this.y / (height * 0.10), 1.0);
             if (convergeFactor < 0) convergeFactor = 0;
 
             if (convergeFactor > 0) {
@@ -222,8 +222,8 @@ class Particle {
         forceY += this.gravity;
 
         // Extra downward push near the top so particles don't stagnate in the delta zone
-        if (this.y < height * 0.15) {
-            let topFactor = 1.0 - (this.y / (height * 0.15));
+        if (this.y < height * 0.10) {
+            let topFactor = 1.0 - (this.y / (height * 0.10));
             forceY += topFactor * 2.0;
         }
 
@@ -253,26 +253,44 @@ class Particle {
 
         // Fluid characteristics:
         // Particles near the top (delta zone) are always visible and don't decay fast,
-        // even when spread thin, so deltas can form before streams converge
+        // even when spread thin, so deltas can form before streams converge.
+        // A transition zone (20%-35%) softly blends delta treatment into river treatment.
         let inDelta = this.y > 0 && this.y < height * 0.2;
+        let inTransition = !inDelta && this.y >= height * 0.2 && this.y < height * 0.35;
+        // 0 = full delta treatment, 1 = full river treatment
+        let transitionT = inTransition ? (this.y - height * 0.2) / (height * 0.15) : 1.0;
         let inStream = cellWetness >= WETNESS_DRY_THRESHOLD;
-        if (!inStream && !inDelta && !this.isSource) {
+
+        if (!inStream && !inDelta && !inTransition && !this.isSource) {
             this.age += 4; // Small stray strands dry up / get absorbed rapidly
             // Fade out based on age — stray particles become invisible over time
             let ageFade = 1.0 - Math.min(this.age / (this.life * 0.3), 1.0);
             this.drawOpacity = MAX_DRAW_OPACITY * 0.15 * ageFade;
         } else {
-            this.age += 0.20; // Live much longer in established deep rivers/lakes
+            // Blend aging rate: delta (0.20) -> river (0.20) for in-stream,
+            // but transition zone strays age faster as they leave the delta
+            let ageRate = 0.20;
+            if (inTransition && !inStream) {
+                ageRate = 0.20 + transitionT * 3.8; // blends toward 4.0
+            }
+            this.age += ageRate;
+
             let baseOpacity = Math.min(MAX_DRAW_OPACITY, cellWetness / 100);
             if (inDelta) {
                 // Delta particles fade as they age without finding a stream
                 let deltaAge = Math.min(this.age / (this.life * 0.5), 1.0);
                 let deltaFade = 1.0 - deltaAge * 0.7;
                 baseOpacity = Math.max(baseOpacity, MAX_DRAW_OPACITY * deltaFade);
+            } else if (inTransition && !inStream) {
+                // Transition zone: blend delta opacity boost toward zero
+                let deltaAge = Math.min(this.age / (this.life * 0.5), 1.0);
+                let deltaFade = 1.0 - deltaAge * 0.7;
+                let deltaOpacity = MAX_DRAW_OPACITY * deltaFade;
+                baseOpacity = Math.max(baseOpacity, deltaOpacity * (1.0 - transitionT));
             }
             this.drawOpacity = baseOpacity;
         }
-        this.inDelta = inDelta;
+        this.inDelta = inDelta || inTransition;
 
         // Reset if out of bounds or too old
         if (this.x < -50 || this.x > width + 50 || this.y > height + 50 || this.age > this.life) {
@@ -349,8 +367,9 @@ function animate() {
 
         const regions = [
             { y: 0,              label: 'Spawn boundary (y=0)',        color: '#ff4444' },
-            { y: height * 0.15,  label: 'Convergence ramp end (15%)',  color: '#ffaa00' },
+            { y: height * 0.10,  label: 'Convergence ramp end (10%)',  color: '#ffaa00' },
             { y: height * 0.2,   label: 'Delta zone end (20%)',        color: '#44ff44' },
+            { y: height * 0.35,  label: 'Transition zone end (35%)',   color: '#4488ff' },
         ];
 
         for (const r of regions) {

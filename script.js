@@ -246,7 +246,7 @@ class Particle {
         this.y += this.vy;
 
         // Source particles are confined to the delta zone — reset when they leave
-        if (this.isSource && this.y > height * 0.2) {
+        if (this.isSource && this.y > height * 0.3) {
             this.reset();
             return;
         }
@@ -255,10 +255,10 @@ class Particle {
         // Particles near the top (delta zone) are always visible and don't decay fast,
         // even when spread thin, so deltas can form before streams converge.
         // A transition zone (20%-35%) softly blends delta treatment into river treatment.
-        let inDelta = this.y > 0 && this.y < height * 0.2;
-        let inTransition = !inDelta && this.y >= height * 0.2 && this.y < height * 0.35;
+        let inDelta = this.y > 0 && this.y < height * 0.3;
+        let inTransition = !inDelta && this.y >= height * 0.3 && this.y < height * 0.45;
         // 0 = full delta treatment, 1 = full river treatment
-        let transitionT = inTransition ? (this.y - height * 0.2) / (height * 0.15) : 1.0;
+        let transitionT = inTransition ? (this.y - height * 0.3) / (height * 0.15) : 1.0;
         let inStream = cellWetness >= WETNESS_DRY_THRESHOLD;
 
         if (!inStream && !inDelta && !inTransition && !this.isSource) {
@@ -368,8 +368,8 @@ function animate() {
         const regions = [
             { y: 0,              label: 'Spawn boundary (y=0)',        color: '#ff4444' },
             { y: height * 0.10,  label: 'Convergence ramp end (10%)',  color: '#ffaa00' },
-            { y: height * 0.2,   label: 'Delta zone end (20%)',        color: '#44ff44' },
-            { y: height * 0.35,  label: 'Transition zone end (35%)',   color: '#4488ff' },
+            { y: height * 0.3,   label: 'Delta zone end (30%)',        color: '#44ff44' },
+            { y: height * 0.45,  label: 'Transition zone end (45%)',   color: '#4488ff' },
         ];
 
         for (const r of regions) {

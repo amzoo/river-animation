@@ -4,6 +4,7 @@ const ctx = canvas.getContext('2d');
 let width, height;
 let particles = [];
 let sourcePoints = [];
+let debugOverlay = false; // Toggle with 'D' key
 // ==========================================
 // CONFIGURATION & TUNING VARIABLES
 // ==========================================
@@ -338,10 +339,41 @@ function animate() {
         particles[i].draw();
     }
 
+    // Debug overlay: dotted lines at vertical region boundaries
+    if (debugOverlay) {
+        ctx.save();
+        ctx.setLineDash([8, 6]);
+        ctx.lineWidth = 1;
+        ctx.font = '12px monospace';
+        ctx.textBaseline = 'top';
+
+        const regions = [
+            { y: 0,              label: 'Spawn boundary (y=0)',        color: '#ff4444' },
+            { y: height * 0.15,  label: 'Convergence ramp end (15%)',  color: '#ffaa00' },
+            { y: height * 0.2,   label: 'Delta zone end (20%)',        color: '#44ff44' },
+        ];
+
+        for (const r of regions) {
+            ctx.strokeStyle = r.color;
+            ctx.fillStyle = r.color;
+            ctx.beginPath();
+            ctx.moveTo(0, r.y);
+            ctx.lineTo(width, r.y);
+            ctx.stroke();
+            ctx.fillText(r.label, 8, r.y + 4);
+        }
+
+        ctx.restore();
+    }
+
     // Slowly evolve the noise for shifting rivers
     zOff += NOISE_EVOLUTION_SPEED;
 
     requestAnimationFrame(animate);
 }
+
+window.addEventListener('keydown', (e) => {
+    if (e.key === 'd' || e.key === 'D') debugOverlay = !debugOverlay;
+});
 
 animate();

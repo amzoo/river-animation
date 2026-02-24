@@ -78,7 +78,7 @@ const FADE_SLOW_AMOUNT = 1;
 const FADE_FAST_AMOUNT = 3;
 // ==========================================
 
-let mouse = { x: 0, y: 0, prevX: 0, prevY: 0, frameDX: 0, frameDY: 0, speed: 0, active: false, lastTime: 0 };
+let mouse = { x: 0, y: 0, prevX: 0, prevY: 0, frameDX: 0, frameDY: 0, dirX: 0, dirY: 1, targetDirX: 0, targetDirY: 1, speed: 0, active: false, middleDown: false, lastTime: 0 };
 let burst = { charging: false, x: 0, y: 0, startTime: 0 };
 const BURST_MIN_RADIUS = 50;
 const BURST_MAX_RADIUS = 300;
@@ -279,14 +279,30 @@ class Particle {
         this.x += this.vx;
         this.y += this.vy;
 
-        // Mouse bar displacement — physically push particles
-        if (mouse.active && (mouse.frameDX !== 0 || mouse.frameDY !== 0)) {
+        // Mouse pill displacement — physically push particles
+        // Pill: 100px long axis (perpendicular to motion), 20px short axis (along motion)
+        if (mouse.active && mouse.middleDown && (mouse.frameDX !== 0 || mouse.frameDY !== 0)) {
+            let halfLength = 90; // half of line segment (pill total = 80 + 2*10 = 100)
+            let halfWidth = 10;  // radius of capsule (pill width = 20)
+            // Long axis is perpendicular to mouse direction
+            let perpX = -mouse.dirY;
+            let perpY = mouse.dirX;
+            // Vector from mouse to particle
             let mdx = this.x - mouse.x;
             let mdy = this.y - mouse.y;
-            let dist = Math.sqrt(mdx * mdx + mdy * mdy);
-            let radius = 120;
-            if (dist < radius) {
-                let falloff = 1.0 - dist / radius;
+            // Project onto pill axes
+            let alongLong = mdx * perpX + mdy * perpY;
+            let alongShort = mdx * mouse.dirX + mdy * mouse.dirY;
+            // Clamp long-axis projection to segment
+            let clamped = Math.max(-halfLength, Math.min(halfLength, alongLong));
+            // Nearest point on segment to particle
+            let nearX = mouse.x + perpX * clamped;
+            let nearY = mouse.y + perpY * clamped;
+            let distX = this.x - nearX;
+            let distY = this.y - nearY;
+            let dist = Math.sqrt(distX * distX + distY * distY);
+            if (dist < halfWidth) {
+                let falloff = 1.0 - dist / halfWidth;
                 this.x += mouse.frameDX * falloff;
                 this.y += mouse.frameDY * falloff;
                 this.vx += mouse.frameDX * falloff * 0.3;
@@ -413,6 +429,14 @@ function animate() {
         particles[i].draw();
     }
 
+    // Smoothly interpolate pill direction toward target
+    let lerpRate = 0.1;
+    mouse.dirX += (mouse.targetDirX - mouse.dirX) * lerpRate;
+    mouse.dirY += (mouse.targetDirY - mouse.dirY) * lerpRate;
+    let dirLen = Math.sqrt(mouse.dirX * mouse.dirX + mouse.dirY * mouse.dirY) || 1;
+    mouse.dirX /= dirLen;
+    mouse.dirY /= dirLen;
+
     // Reset per-frame mouse displacement accumulators (after particles have read them)
     mouse.frameDX = 0;
     mouse.frameDY = 0;
@@ -460,18 +484,32 @@ function animate() {
             overlayCtx.fillText(r.label, 8, r.y + 4);
         }
 
-        // Draw mouse push radius
+        // Draw mouse push pill
         if (mouse.active) {
-            overlayCtx.setLineDash([4, 4]);
-            overlayCtx.strokeStyle = 'rgba(255, 100, 100, 0.6)';
+            let halfLength = 90;
+            let halfWidth = 10;
+            let perpX = -mouse.dirY;
+            let perpY = mouse.dirX;
+            // Draw pill shape: two semicircles connected by lines
+            overlayCtx.setLineDash(mouse.middleDown ? [] : [4, 4]);
+            overlayCtx.strokeStyle = mouse.middleDown ? 'rgba(255, 100, 100, 0.9)' : 'rgba(255, 100, 100, 0.6)';
             overlayCtx.lineWidth = 1;
+            // Endpoints of the center line segment
+            let ax = mouse.x + perpX * halfLength;
+            let ay = mouse.y + perpY * halfLength;
+            let bx = mouse.x - perpX * halfLength;
+            let by = mouse.y - perpY * halfLength;
+            // Angle of the perpendicular axis
+            let angle = Math.atan2(perpY, perpX);
             overlayCtx.beginPath();
-            overlayCtx.arc(mouse.x, mouse.y, 120, 0, Math.PI * 2);
+            overlayCtx.arc(ax, ay, halfWidth, angle - Math.PI / 2, angle + Math.PI / 2);
+            overlayCtx.arc(bx, by, halfWidth, angle + Math.PI / 2, angle + Math.PI / 2 + Math.PI);
+            overlayCtx.closePath();
             overlayCtx.stroke();
             overlayCtx.fillStyle = 'rgba(255, 100, 100, 0.05)';
             overlayCtx.fill();
             overlayCtx.fillStyle = '#ff6464';
-            overlayCtx.fillText('Push radius (120px)', mouse.x + 125, mouse.y - 5);
+            overlayCtx.fillText('Push pill (100x20)', mouse.x + halfLength + 15, mouse.y - 5);
         }
 
         overlayCtx.restore();
@@ -484,8 +522,16 @@ function animate() {
 }
 
 canvas.addEventListener('mousemove', (e) => {
-    mouse.frameDX += e.clientX - mouse.x;
-    mouse.frameDY += e.clientY - mouse.y;
+    let dx = e.clientX - mouse.x;
+    let dy = e.clientY - mouse.y;
+    mouse.frameDX += dx;
+    mouse.frameDY += dy;
+    // Update target direction when mouse is moving
+    let len = Math.sqrt(dx * dx + dy * dy);
+    if (len > 1) {
+        mouse.targetDirX = dx / len;
+        mouse.targetDirY = dy / len;
+    }
     mouse.x = e.clientX;
     mouse.y = e.clientY;
     mouse.active = true;
@@ -493,9 +539,14 @@ canvas.addEventListener('mousemove', (e) => {
 
 canvas.addEventListener('mouseleave', () => {
     mouse.active = false;
+    mouse.middleDown = false;
 });
 
+// Prevent default middle-click auto-scroll
+canvas.addEventListener('auxclick', (e) => { if (e.button === 1) e.preventDefault(); });
+
 canvas.addEventListener('mousedown', (e) => {
+    if (e.button === 1) { mouse.middleDown = true; e.preventDefault(); return; }
     if (e.button !== 0) return;
     burst.charging = true;
     burst.x = e.clientX;
@@ -504,6 +555,7 @@ canvas.addEventListener('mousedown', (e) => {
 });
 
 canvas.addEventListener('mouseup', (e) => {
+    if (e.button === 1) { mouse.middleDown = false; return; }
     if (!burst.charging) return;
     burst.charging = false;
     let elapsed = performance.now() - burst.startTime;

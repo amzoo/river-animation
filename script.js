@@ -72,7 +72,7 @@ const FADE_HOLD_THRESHOLD = 190;
 // How much RGB to subtract when path is bright (slow fade)
 const FADE_SLOW_AMOUNT = 1;
 // How much RGB to subtract when path drops below threshold (fast fade)
-const FADE_FAST_AMOUNT = 6;
+const FADE_FAST_AMOUNT = 3;
 // ==========================================
 
 let zOff = 0;
@@ -301,22 +301,14 @@ class Particle {
     draw() {
         if (this.drawOpacity <= MIN_DRAW_OPACITY) return; // Don't paint invisible tiny swimmers
 
+        ctx.fillStyle = `rgba(255, 255, 255, ${this.drawOpacity})`;
+        ctx.beginPath();
         // Width based on weight and age
         let radius = this.weight * 1.5 * (Math.sin((this.age / this.life) * Math.PI));
         // Larger particles in the delta zone so the fan is visible
         if (this.inDelta) radius = Math.max(radius, 1.5);
         if (radius < 0.1) radius = 0.1;
-
-        // Radial gradient for soft glow
-        let glowRadius = radius * 2.5;
-        let grad = ctx.createRadialGradient(this.x, this.y, 0, this.x, this.y, glowRadius);
-        grad.addColorStop(0, `rgba(255, 255, 255, ${this.drawOpacity})`);
-        grad.addColorStop(0.4, `rgba(255, 255, 255, ${this.drawOpacity * 0.4})`);
-        grad.addColorStop(1, 'rgba(255, 255, 255, 0)');
-
-        ctx.fillStyle = grad;
-        ctx.beginPath();
-        ctx.arc(this.x, this.y, glowRadius, 0, Math.PI * 2);
+        ctx.arc(this.x, this.y, radius, 0, Math.PI * 2);
         ctx.fill();
     }
 }
@@ -358,6 +350,13 @@ function animate() {
             }
         }
         ctx.putImageData(imgData, 0, 0);
+
+        // Subtle blur pass to soften accumulated trail edges
+        ctx.save();
+        ctx.filter = 'blur(0.8px)';
+        ctx.globalAlpha = 0.6;
+        ctx.drawImage(canvas, 0, 0);
+        ctx.restore();
     }
 
     for (let i = 0; i < particles.length; i++) {

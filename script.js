@@ -301,14 +301,22 @@ class Particle {
     draw() {
         if (this.drawOpacity <= MIN_DRAW_OPACITY) return; // Don't paint invisible tiny swimmers
 
-        ctx.fillStyle = `rgba(255, 255, 255, ${this.drawOpacity})`;
-        ctx.beginPath();
         // Width based on weight and age
         let radius = this.weight * 1.5 * (Math.sin((this.age / this.life) * Math.PI));
         // Larger particles in the delta zone so the fan is visible
         if (this.inDelta) radius = Math.max(radius, 1.5);
         if (radius < 0.1) radius = 0.1;
-        ctx.arc(this.x, this.y, radius, 0, Math.PI * 2);
+
+        // Radial gradient for soft glow
+        let glowRadius = radius * 2.5;
+        let grad = ctx.createRadialGradient(this.x, this.y, 0, this.x, this.y, glowRadius);
+        grad.addColorStop(0, `rgba(255, 255, 255, ${this.drawOpacity})`);
+        grad.addColorStop(0.4, `rgba(255, 255, 255, ${this.drawOpacity * 0.4})`);
+        grad.addColorStop(1, 'rgba(255, 255, 255, 0)');
+
+        ctx.fillStyle = grad;
+        ctx.beginPath();
+        ctx.arc(this.x, this.y, glowRadius, 0, Math.PI * 2);
         ctx.fill();
     }
 }

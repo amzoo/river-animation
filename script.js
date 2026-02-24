@@ -151,6 +151,7 @@ class Particle {
         this.life = Math.random() * PARTICLE_LIFE_VAR + PARTICLE_LIFE_BASE;
         this.age = 0;
         this.drawOpacity = 0;
+        this.stagnation = 0;
     }
 
     update() {
@@ -206,6 +207,8 @@ class Particle {
                 if (pullAbs > 0.01) {
                     let sign = pullX > 0 ? 1 : -1;
                     let attractStrength = Math.min(pullAbs * 0.1, 2.0) * convergeFactor;
+                    let stagnationBoost = 1.0 + this.stagnation * 0.05;
+                    attractStrength *= stagnationBoost;
                     forceX += sign * attractStrength;
                 }
             }
@@ -223,12 +226,23 @@ class Particle {
 
         // Add per-particle downward gravity. Low gravity particles will get trapped
         // in local minima 'lakes' and swirl, high gravity will force main rivers down.
-        forceY += this.gravity;
+        // Stagnant particles get extra downward push to escape local minima
+        forceY += this.gravity + this.stagnation * 0.02;
 
         // Extra downward push near the top so particles don't stagnate in the delta zone
         if (this.y < height * 0.10) {
             let topFactor = 1.0 - (this.y / (height * 0.10));
             forceY += topFactor * 2.0;
+        }
+
+        // Push particles away from left/right edges
+        let edgeMargin = width * 0.05;
+        if (this.x < edgeMargin) {
+            let edgeFactor = 1.0 - (this.x / edgeMargin);
+            forceX += edgeFactor * 2.0;
+        } else if (this.x > width - edgeMargin) {
+            let edgeFactor = 1.0 - ((width - this.x) / edgeMargin);
+            forceX += -edgeFactor * 2.0;
         }
 
         // Normalize total force
@@ -245,6 +259,15 @@ class Particle {
 
         // Prevent particles from moving upward — water flows downhill
         if (this.vy < 0) this.vy *= 0.1;
+
+        // Track stagnation: particles barely moving accumulate stagnation,
+        // which boosts their attraction toward nearby streams
+        let speed = Math.sqrt(this.vx * this.vx + this.vy * this.vy);
+        if (speed < 0.3) {
+            this.stagnation = Math.min(this.stagnation + 1, 60);
+        } else {
+            this.stagnation *= 0.95;
+        }
 
         this.x += this.vx;
         this.y += this.vy;

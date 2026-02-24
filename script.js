@@ -3,6 +3,7 @@ const ctx = canvas.getContext('2d');
 
 let width, height;
 let particles = [];
+let sourcePoints = [];
 // ==========================================
 // CONFIGURATION & TUNING VARIABLES
 // ==========================================
@@ -21,7 +22,7 @@ const NOISE_EPSILON = 0.1;
 
 // --- Fluid & Wetness Grid ---
 // Size of each grid cell (px) for tracking water accumulation
-const GRID_SIZE = 5;
+const GRID_SIZE = 3;
 // How quickly the wetness map dries up every frame (multiplier, 0.99 = 1% loss)
 const EVAPORATION_RATE = 0.99;
 // Added to wetness grid when particle is present
@@ -29,12 +30,22 @@ const WETNESS_DEPOSIT = 0.2;
 // Threshold of wetness below which a particle is considered "dry"
 const WETNESS_DRY_THRESHOLD = 3.0;
 
+// --- Erosion ---
+// How much erosion accumulates per particle per frame
+const EROSION_DEPOSIT = 0.05;
+// How quickly erosion heals (1.0 = never, 0.999 = very slowly)
+const EROSION_DECAY = 0.9999;
+// Max erosion value a cell can reach
+const EROSION_MAX = 25.0;
+// How strongly erosion widens channels (lateral spread multiplier)
+const EROSION_SPREAD_STRENGTH = 0.35;
+
 // --- Particle Physics ---
 const PARTICLE_SPEED_BASE = 0.4;
 const PARTICLE_SPEED_VAR = 0.8;
 
-const PARTICLE_WEIGHT_BASE = 1.0;
-const PARTICLE_WEIGHT_VAR = 2.5;
+const PARTICLE_WEIGHT_BASE = 0.3;
+const PARTICLE_WEIGHT_VAR = 0.7;
 
 // Gravity variance: some flow fast downhill, some drag and swirl in lakes
 const PARTICLE_GRAVITY_BASE = 0.1;
@@ -64,6 +75,7 @@ const FADE_FAST_AMOUNT = 6;
 let zOff = 0;
 let cols, rows;
 let wetnessGrid;
+let erosionGrid;
 
 const simplex = new SimplexNoise();
 
@@ -90,6 +102,17 @@ function resize() {
     cols = Math.ceil(width / GRID_SIZE);
     rows = Math.ceil(height / GRID_SIZE);
     wetnessGrid = new Float32Array(cols * rows);
+    erosionGrid = new Float32Array(cols * rows);
+
+    // Generate fixed source points across the top edge (only on first load)
+    if (sourcePoints.length === 0) {
+        const NUM_SOURCES = 6;
+        const margin = width * 0.1;
+        const spacing = (width - 2 * margin) / (NUM_SOURCES - 1);
+        for (let i = 0; i < NUM_SOURCES; i++) {
+            sourcePoints.push(margin + i * spacing);
+        }
+    }
 
     ctx.fillStyle = 'black';
     ctx.fillRect(0, 0, width, height);
@@ -101,12 +124,15 @@ resize();
 class Particle {
     constructor() {
         this.reset();
+        // Spread initial particles vertically so they don't all bunch at the top
+        this.y = -Math.random() * height * 0.3;
     }
 
     reset() {
-        this.x = Math.random() * width;
-        // Spawning mostly from the top to create long vertical rivers, but more spread out
-        this.y = -Math.random() * height * 0.2;
+        // Spawn from a random fixed source point with wide delta spread
+        const src = sourcePoints[Math.floor(Math.random() * sourcePoints.length)];
+        this.x = src + (Math.random() - 0.5) * 120;
+        this.y = -Math.random() * 30;
         this.vx = 0;
         this.vy = 0;
         this.speed = Math.random() * PARTICLE_SPEED_VAR + PARTICLE_SPEED_BASE;
@@ -146,25 +172,55 @@ class Particle {
             wetnessGrid[idx] += WETNESS_DEPOSIT; // deposit water
             cellWetness = wetnessGrid[idx];
 
-            // Calculate pressure gradient from wetness to push OUT of lakes
-            let wLeft = c > 0 ? wetnessGrid[idx - 1] : cellWetness;
-            let wRight = c < cols - 1 ? wetnessGrid[idx + 1] : cellWetness;
-            let wUp = r > 0 ? wetnessGrid[idx - cols] : cellWetness;
-            let wDown = r < rows - 1 ? wetnessGrid[idx + cols] : cellWetness;
+            // Accumulate erosion where water flows (very slow, persistent)
+            if (erosionGrid[idx] < EROSION_MAX) {
+                erosionGrid[idx] += EROSION_DEPOSIT;
+            }
+            let cellErosion = erosionGrid[idx];
 
-            let px = -(wRight - wLeft);
-            let py = -(wDown - wUp);
+            // Scan laterally for nearby wet channels and pull toward the strongest one.
+            // Larger channels (higher wetness+erosion) pull from further away,
+            // causing small parallel streams to merge into dominant rivers.
+            let convergeFactor = Math.min(this.y / (height * 0.15), 1.0);
+            if (convergeFactor < 0) convergeFactor = 0;
 
-            let plen = Math.sqrt(px * px + py * py) || 1;
+            if (convergeFactor > 0) {
+                let pullX = 0;
+                const SCAN_RADIUS = 40; // cells to scan in each direction
+                for (let s = 1; s <= SCAN_RADIUS; s++) {
+                    let distFalloff = 1.0 / (s * s); // inverse square falloff
+                    let wL = (c - s >= 0) ? wetnessGrid[idx - s] + erosionGrid[idx - s] * 3 : 0;
+                    let wR = (c + s < cols) ? wetnessGrid[idx + s] + erosionGrid[idx + s] * 3 : 0;
+                    pullX += (wR - wL) * distFalloff;
+                }
+                let pullAbs = Math.abs(pullX);
+                if (pullAbs > 0.01) {
+                    let sign = pullX > 0 ? 1 : -1;
+                    let attractStrength = Math.min(pullAbs * 0.1, 2.0) * convergeFactor;
+                    forceX += sign * attractStrength;
+                }
+            }
 
-            // Pressure pushing outward grows stronger as lake gets deeper
-            forceX += (px / plen) * Math.min(cellWetness * 0.01, 1.5);
-            forceY += (py / plen) * Math.min(cellWetness * 0.01, 1.5);
+            // Erosion-based widening: more eroded channels spread particles laterally,
+            // simulating how rivers carve wider beds over time
+            let erosionSpread = cellErosion * EROSION_SPREAD_STRENGTH;
+            forceX += (Math.random() - 0.5) * erosionSpread;
+
+            // Base lateral spread at high wetness (immediate width from water volume)
+            if (cellWetness > 15) {
+                forceX += (Math.random() - 0.5) * Math.min(cellWetness * 0.005, 0.3);
+            }
         }
 
-        // Add per-particle downward gravity. Low gravity particles will get trapped 
+        // Add per-particle downward gravity. Low gravity particles will get trapped
         // in local minima 'lakes' and swirl, high gravity will force main rivers down.
         forceY += this.gravity;
+
+        // Extra downward push near the top so particles don't stagnate in the delta zone
+        if (this.y < height * 0.15) {
+            let topFactor = 1.0 - (this.y / (height * 0.15));
+            forceY += topFactor * 2.0;
+        }
 
         // Normalize total force
         let length = Math.sqrt(forceX * forceX + forceY * forceY) || 1;
@@ -178,25 +234,38 @@ class Particle {
         this.vx *= FRICTION;
         this.vy *= FRICTION;
 
+        // Prevent particles from moving upward — water flows downhill
+        if (this.vy < 0) this.vy *= 0.1;
+
         this.x += this.vx;
         this.y += this.vy;
 
         // Fluid characteristics:
-        if (cellWetness < WETNESS_DRY_THRESHOLD) {
+        // Particles near the top (delta zone) are always visible and don't decay fast,
+        // even when spread thin, so deltas can form before streams converge
+        let inDelta = this.y > 0 && this.y < height * 0.2;
+        let inStream = cellWetness >= WETNESS_DRY_THRESHOLD;
+        if (!inStream && !inDelta) {
             this.age += 4; // Small stray strands dry up / get absorbed rapidly
-            this.drawOpacity = 0; // Don't draw solitary particles
+            // Fade out based on age — stray particles become invisible over time
+            let ageFade = 1.0 - Math.min(this.age / (this.life * 0.3), 1.0);
+            this.drawOpacity = MAX_DRAW_OPACITY * 0.15 * ageFade;
         } else {
             this.age += 0.20; // Live much longer in established deep rivers/lakes
-            // Opacity increases based on water depth
-            this.drawOpacity = Math.min(MAX_DRAW_OPACITY, cellWetness / 100);
+            let baseOpacity = Math.min(MAX_DRAW_OPACITY, cellWetness / 100);
+            if (inDelta) {
+                // Delta particles fade as they age without finding a stream
+                let deltaAge = Math.min(this.age / (this.life * 0.5), 1.0);
+                let deltaFade = 1.0 - deltaAge * 0.7;
+                baseOpacity = Math.max(baseOpacity, MAX_DRAW_OPACITY * deltaFade);
+            }
+            this.drawOpacity = baseOpacity;
         }
+        this.inDelta = inDelta;
 
         // Reset if out of bounds or too old
         if (this.x < -50 || this.x > width + 50 || this.y > height + 50 || this.age > this.life) {
             this.reset();
-            // Once screen is running, mostly spawn from the top
-            this.y = -Math.random() * 50;
-            this.x = Math.random() * width;
         }
     }
 
@@ -206,7 +275,9 @@ class Particle {
         ctx.fillStyle = `rgba(255, 255, 255, ${this.drawOpacity})`;
         ctx.beginPath();
         // Width based on weight and age
-        let radius = this.weight * 2.5 * (Math.sin((this.age / this.life) * Math.PI));
+        let radius = this.weight * 1.5 * (Math.sin((this.age / this.life) * Math.PI));
+        // Larger particles in the delta zone so the fan is visible
+        if (this.inDelta) radius = Math.max(radius, 1.5);
         if (radius < 0.1) radius = 0.1;
         ctx.arc(this.x, this.y, radius, 0, Math.PI * 2);
         ctx.fill();
@@ -218,9 +289,10 @@ for (let i = 0; i < NUM_PARTICLES; i++) {
 }
 
 function animate() {
-    // Evaporate wetness grid
+    // Evaporate wetness grid and slowly decay erosion
     for (let k = 0; k < wetnessGrid.length; k++) {
         wetnessGrid[k] *= EVAPORATION_RATE;
+        erosionGrid[k] *= EROSION_DECAY;
     }
 
     // Instead of using fillRect with a very low opacity (which gets stuck  

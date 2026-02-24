@@ -14,6 +14,7 @@ let debugOverlay = false; // Toggle with 'D' key
 // --- Overall Simulation ---
 // Number of particles spawned in the simulation
 const NUM_PARTICLES = 16000;
+const BURST_COUNT = 200;
 // Fraction of particles dedicated to the delta zone (reset when they leave it)
 const SOURCE_PARTICLE_FRACTION = 0.25;
 
@@ -76,6 +77,12 @@ const FADE_SLOW_AMOUNT = 1;
 // How much RGB to subtract when path drops below threshold (fast fade)
 const FADE_FAST_AMOUNT = 3;
 // ==========================================
+
+let mouse = { x: 0, y: 0, prevX: 0, prevY: 0, frameDX: 0, frameDY: 0, speed: 0, active: false, lastTime: 0 };
+let burst = { charging: false, x: 0, y: 0, startTime: 0 };
+const BURST_MIN_RADIUS = 50;
+const BURST_MAX_RADIUS = 300;
+const BURST_CHARGE_TIME = 2000; // ms to reach max size
 
 let zOff = 0;
 let cols, rows;
@@ -272,6 +279,21 @@ class Particle {
         this.x += this.vx;
         this.y += this.vy;
 
+        // Mouse bar displacement — physically push particles
+        if (mouse.active && (mouse.frameDX !== 0 || mouse.frameDY !== 0)) {
+            let mdx = this.x - mouse.x;
+            let mdy = this.y - mouse.y;
+            let dist = Math.sqrt(mdx * mdx + mdy * mdy);
+            let radius = 120;
+            if (dist < radius) {
+                let falloff = 1.0 - dist / radius;
+                this.x += mouse.frameDX * falloff;
+                this.y += mouse.frameDY * falloff;
+                this.vx += mouse.frameDX * falloff * 0.3;
+                this.vy += mouse.frameDY * falloff * 0.3;
+            }
+        }
+
         // Source particles are confined to the delta zone — reset when they leave
         if (this.isSource && this.y > height * 0.3) {
             this.reset();
@@ -391,6 +413,27 @@ function animate() {
         particles[i].draw();
     }
 
+    // Reset per-frame mouse displacement accumulators (after particles have read them)
+    mouse.frameDX = 0;
+    mouse.frameDY = 0;
+
+    // Draw burst charge preview
+    if (burst.charging) {
+        let elapsed = performance.now() - burst.startTime;
+        let t = Math.min(elapsed / BURST_CHARGE_TIME, 1.0);
+        let radius = BURST_MIN_RADIUS + (BURST_MAX_RADIUS - BURST_MIN_RADIUS) * t;
+        ctx.save();
+        ctx.beginPath();
+        ctx.arc(burst.x, burst.y, radius, 0, Math.PI * 2);
+        ctx.strokeStyle = `rgba(255, 255, 255, ${0.15 + t * 0.25})`;
+        ctx.lineWidth = 1;
+        ctx.stroke();
+        // Subtle fill
+        ctx.fillStyle = `rgba(255, 255, 255, ${0.02 + t * 0.04})`;
+        ctx.fill();
+        ctx.restore();
+    }
+
     // Debug overlay: dotted lines at vertical region boundaries (drawn on separate canvas)
     overlayCtx.clearRect(0, 0, width, height);
     if (debugOverlay) {
@@ -417,6 +460,20 @@ function animate() {
             overlayCtx.fillText(r.label, 8, r.y + 4);
         }
 
+        // Draw mouse push radius
+        if (mouse.active) {
+            overlayCtx.setLineDash([4, 4]);
+            overlayCtx.strokeStyle = 'rgba(255, 100, 100, 0.6)';
+            overlayCtx.lineWidth = 1;
+            overlayCtx.beginPath();
+            overlayCtx.arc(mouse.x, mouse.y, 120, 0, Math.PI * 2);
+            overlayCtx.stroke();
+            overlayCtx.fillStyle = 'rgba(255, 100, 100, 0.05)';
+            overlayCtx.fill();
+            overlayCtx.fillStyle = '#ff6464';
+            overlayCtx.fillText('Push radius (120px)', mouse.x + 125, mouse.y - 5);
+        }
+
         overlayCtx.restore();
     }
 
@@ -425,6 +482,44 @@ function animate() {
 
     requestAnimationFrame(animate);
 }
+
+canvas.addEventListener('mousemove', (e) => {
+    mouse.frameDX += e.clientX - mouse.x;
+    mouse.frameDY += e.clientY - mouse.y;
+    mouse.x = e.clientX;
+    mouse.y = e.clientY;
+    mouse.active = true;
+});
+
+canvas.addEventListener('mouseleave', () => {
+    mouse.active = false;
+});
+
+canvas.addEventListener('mousedown', (e) => {
+    if (e.button !== 0) return;
+    burst.charging = true;
+    burst.x = e.clientX;
+    burst.y = e.clientY;
+    burst.startTime = performance.now();
+});
+
+canvas.addEventListener('mouseup', (e) => {
+    if (!burst.charging) return;
+    burst.charging = false;
+    let elapsed = performance.now() - burst.startTime;
+    let t = Math.min(elapsed / BURST_CHARGE_TIME, 1.0);
+    let radius = BURST_MIN_RADIUS + (BURST_MAX_RADIUS - BURST_MIN_RADIUS) * t;
+    let count = Math.floor(BURST_COUNT + (BURST_COUNT * 4) * t); // 200 to 1000
+    for (let i = 0; i < count; i++) {
+        let p = new Particle();
+        let angle = Math.random() * Math.PI * 2;
+        let r = Math.random() * radius;
+        p.x = burst.x + Math.cos(angle) * r;
+        p.y = burst.y + Math.sin(angle) * r;
+        p.isSource = false;
+        particles.push(p);
+    }
+});
 
 window.addEventListener('keydown', (e) => {
     if (e.key === 'd' || e.key === 'D') debugOverlay = !debugOverlay;

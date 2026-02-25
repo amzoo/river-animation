@@ -92,8 +92,8 @@ const CAPILLARY_LATERAL_FORCE = 2.5;
 const CAPILLARY_GRAVITY = 0.14;
 const CAPILLARY_MAX_OPACITY = 0.35;
 const CAPILLARY_MAX_RADIUS = 1.4;
-const CAPILLARY_PHEROMONE_DEPOSIT = 0.4;
-const CAPILLARY_PHEROMONE_ATTRACT = 0.15;
+const CAPILLARY_PHEROMONE_DEPOSIT = 0.8;
+const CAPILLARY_PHEROMONE_ATTRACT = 0.5;
 const CAPILLARY_PHEROMONE_EVAP = 0.997;
 const CAPILLARY_TARGET_WETNESS = 3.0;
 const CAPILLARY_WIGGLE_STRENGTH = 0.25;
@@ -624,6 +624,24 @@ class Particle {
         let fadeIn = Math.min(this.age / 20, 1.0);
         this.drawOpacity = CAPILLARY_MAX_OPACITY * fadeIn;
 
+        // River absorption: capillaries get sucked into their own source's river
+        {
+            let rzYStart = Math.floor(height * TRANSITION_ZONE_END);
+            let rr = Math.floor((this.y - rzYStart) / RIVER_CELL_SIZE);
+            let rc = Math.floor(this.x / RIVER_CELL_SIZE);
+            if (rr >= 0 && rr < riverGridRows && rc >= 0 && rc < riverGridCols) {
+                let lbl = riverLabels[rr * riverGridCols + rc];
+                if (lbl > 0) {
+                    let compSource = riverComponentColors[lbl - 1];
+                    if (compSource >= 0 && compSource !== this.sourceIdx) {
+                        // Kill lateral velocity, lock into river flow
+                        this.vx *= 0.3;
+                        this.vy = this.vy * 0.5 + CAPILLARY_GRAVITY * 3.0;
+                    }
+                }
+            }
+        }
+
         // Foreign stream detection: rapid decay when hitting another source's river
         if (this.age > 15) {
             let rzYStart = Math.floor(height * TRANSITION_ZONE_END);
@@ -1037,7 +1055,7 @@ function animate() {
 
         // Subtle blur pass to soften accumulated trail edges
         ctx.save();
-        ctx.filter = 'blur(0.6px)';
+        ctx.filter = 'blur(0.8px)';
         ctx.globalAlpha = 0.5;
         ctx.drawImage(canvas, 0, 0);
         ctx.restore();

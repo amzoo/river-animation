@@ -13,6 +13,7 @@ let particleStatsOverlay = false; // Toggle with 'P' key
 let transparentParticles = false; // Toggle with 'T' key
 let sourceColorParticles = false; // Toggle with 'C' key
 let riverSampleMode = false;       // toggled by 'R' key
+let _prevOverlayActive = false;    // tracks overlay state for lazy clear
 let riverSampleRect = null;        // {x, y, w, h} in pixels — the selected rectangle
 let riverSampleDragging = false;   // true while mouse is held down to size the rect
 let riverSampleStart = null;       // {x, y} — mouse position at drag start
@@ -23,7 +24,7 @@ let riverSampleStats = null;       // computed stats object, displayed on overla
 
 // --- Overall Simulation ---
 // Number of particles spawned in the simulation
-const NUM_PARTICLES = 20000;
+const NUM_PARTICLES = 30000;
 const BURST_COUNT = 200;
 // Fraction of particles dedicated to the delta zone (reset when they leave it)
 const SOURCE_PARTICLE_FRACTION = 0.25;
@@ -40,7 +41,7 @@ const NOISE_EPSILON = 0.1;
 // Size of each grid cell (px) for tracking water accumulation
 const GRID_SIZE = 3;
 // How quickly the wetness map dries up every frame (multiplier, 0.99 = 1% loss)
-const EVAPORATION_RATE = 0.99;
+const EVAPORATION_RATE = 0.995;
 // Added to wetness grid when particle is present
 const WETNESS_DEPOSIT = 0.2;
 // Threshold of wetness below which a particle is considered "dry"
@@ -122,7 +123,7 @@ let lastFrameTime = performance.now();
 let smoothFPS = 60;
 let simSpeed = 1;
 
-let mouse = { x: 0, y: 0, prevX: 0, prevY: 0, frameDX: 0, frameDY: 0, dirX: 0, dirY: 1, targetDirX: 0, targetDirY: 1, speed: 0, active: false, middleDown: false, lastTime: 0 };
+let mouse = { x: 0, y: 0, prevX: 0, prevY: 0, frameDX: 0, frameDY: 0, speed: 0, active: false, middleDown: false, lastTime: 0 };
 let burst = { charging: false, x: 0, y: 0, startTime: 0 };
 const BURST_MIN_RADIUS = 50;
 const BURST_MAX_RADIUS = 300;
@@ -423,30 +424,14 @@ class Particle {
         this.x += this.vx;
         this.y += this.vy;
 
-        // Mouse pill displacement — physically push particles
-        // Pill: 100px long axis (perpendicular to motion), 20px short axis (along motion)
+        // Mouse circle displacement — physically push particles
         if (mouse.active && mouse.middleDown && (mouse.frameDX !== 0 || mouse.frameDY !== 0)) {
-            let halfLength = 90; // half of line segment (pill total = 80 + 2*10 = 100)
-            let halfWidth = 10;  // radius of capsule (pill width = 20)
-            // Long axis is perpendicular to mouse direction
-            let perpX = -mouse.dirY;
-            let perpY = mouse.dirX;
-            // Vector from mouse to particle
+            let pushRadius = 50;
             let mdx = this.x - mouse.x;
             let mdy = this.y - mouse.y;
-            // Project onto pill axes
-            let alongLong = mdx * perpX + mdy * perpY;
-            let alongShort = mdx * mouse.dirX + mdy * mouse.dirY;
-            // Clamp long-axis projection to segment
-            let clamped = Math.max(-halfLength, Math.min(halfLength, alongLong));
-            // Nearest point on segment to particle
-            let nearX = mouse.x + perpX * clamped;
-            let nearY = mouse.y + perpY * clamped;
-            let distX = this.x - nearX;
-            let distY = this.y - nearY;
-            let dist = Math.sqrt(distX * distX + distY * distY);
-            if (dist < halfWidth) {
-                let falloff = 1.0 - dist / halfWidth;
+            let dist = Math.sqrt(mdx * mdx + mdy * mdy);
+            if (dist < pushRadius) {
+                let falloff = 1.0 - dist / pushRadius;
                 this.x += mouse.frameDX * falloff;
                 this.y += mouse.frameDY * falloff;
                 this.vx += mouse.frameDX * falloff * 0.3;
@@ -503,7 +488,7 @@ class Particle {
         } else {
             // Blend aging rate: delta (0.20) -> river (0.20) for in-stream,
             // but transition zone strays age faster as they leave the delta
-            let ageRate = 0.20;
+            let ageRate = 0.10;
             if (inTransition && !inStream) {
                 ageRate = 0.20 + transitionT * 3.8; // blends toward 4.0
             }
@@ -659,49 +644,6 @@ class Particle {
         }
     }
 
-    draw() {
-        if (this.drawOpacity <= MIN_DRAW_OPACITY) return;
-
-        if (this.isCapillary) {
-            let opacity = transparentParticles ? this.drawOpacity * 0.1 : this.drawOpacity;
-            if (debugOverlay) {
-                let clrD = RIVER_COLORS[this.sourceIdx % RIVER_COLORS.length];
-                ctx.fillStyle = `rgb(${clrD[0]}, ${clrD[1]}, ${clrD[2]})`;
-            } else if (sourceColorParticles) {
-                let clr = RIVER_COLORS[this.sourceIdx % RIVER_COLORS.length];
-                ctx.fillStyle = `rgba(${clr[0]}, ${clr[1]}, ${clr[2]}, ${opacity})`;
-            } else {
-                ctx.fillStyle = `rgba(255, 255, 255, ${opacity})`;
-            }
-            ctx.beginPath();
-            let c = Math.floor(this.x / GRID_SIZE);
-            let r = Math.floor(this.y / GRID_SIZE);
-            let capW = 0;
-            if (c >= 0 && c < cols && r >= 0 && r < rows) {
-                capW = capWetnessGrid[c + r * cols];
-            }
-            let thickness = Math.min(capW / 6.0, 1.0);
-            let radius = 0.8 + thickness * (CAPILLARY_MAX_RADIUS - 0.8);
-            if (radius < 0.1) radius = 0.1;
-            ctx.arc(this.x, this.y, radius, 0, Math.PI * 2);
-            ctx.fill();
-            return;
-        }
-
-        let opacity = transparentParticles ? this.drawOpacity * 0.1 : this.drawOpacity;
-        if (sourceColorParticles) {
-            let clr = RIVER_COLORS[this.sourceIdx % RIVER_COLORS.length];
-            ctx.fillStyle = `rgba(${clr[0]}, ${clr[1]}, ${clr[2]}, ${opacity})`;
-        } else {
-            ctx.fillStyle = `rgba(255, 255, 255, ${opacity})`;
-        }
-        ctx.beginPath();
-        let radius = this.weight * 1.5 * (Math.sin((this.age / this.life) * Math.PI));
-        if (this.inDelta) radius = Math.max(radius, 1.5);
-        if (radius < 0.1) radius = 0.1;
-        ctx.arc(this.x, this.y, radius, 0, Math.PI * 2);
-        ctx.fill();
-    }
 }
 
 const SOURCE_COUNT = Math.floor(NUM_PARTICLES * SOURCE_PARTICLE_FRACTION);
@@ -1109,17 +1051,52 @@ function animate() {
         ctx.restore();
     }
 
+    // Single-pass particle drawing — globalAlpha + fillRect, zero allocations
+    ctx.fillStyle = '#fff';
     for (let i = 0; i < particles.length; i++) {
-        particles[i].draw();
-    }
+        const p = particles[i];
+        if (p.drawOpacity <= MIN_DRAW_OPACITY) continue;
 
-    // Smoothly interpolate pill direction toward target
-    let lerpRate = 0.1;
-    mouse.dirX += (mouse.targetDirX - mouse.dirX) * lerpRate;
-    mouse.dirY += (mouse.targetDirY - mouse.dirY) * lerpRate;
-    let dirLen = Math.sqrt(mouse.dirX * mouse.dirX + mouse.dirY * mouse.dirY) || 1;
-    mouse.dirX /= dirLen;
-    mouse.dirY /= dirLen;
+        let opacity = transparentParticles ? p.drawOpacity * 0.1 : p.drawOpacity;
+        let radius;
+
+        if (p.isCapillary) {
+            let c = Math.floor(p.x / GRID_SIZE);
+            let r = Math.floor(p.y / GRID_SIZE);
+            let capW = (c >= 0 && c < cols && r >= 0 && r < rows) ? capWetnessGrid[c + r * cols] : 0;
+            let thickness = Math.min(capW / 6.0, 1.0);
+            radius = 0.8 + thickness * (CAPILLARY_MAX_RADIUS - 0.8);
+
+            if (debugOverlay) {
+                let clr = RIVER_COLORS[p.sourceIdx % RIVER_COLORS.length];
+                ctx.fillStyle = `rgb(${clr[0]},${clr[1]},${clr[2]})`;
+                ctx.globalAlpha = 1.0;
+            } else if (sourceColorParticles) {
+                let clr = RIVER_COLORS[p.sourceIdx % RIVER_COLORS.length];
+                ctx.fillStyle = `rgb(${clr[0]},${clr[1]},${clr[2]})`;
+                ctx.globalAlpha = opacity;
+            } else {
+                ctx.fillStyle = '#fff';
+                ctx.globalAlpha = opacity;
+            }
+        } else {
+            radius = p.weight * 1.5 * Math.sin((p.age / p.life) * Math.PI);
+            if (p.inDelta) radius = Math.max(radius, 1.5);
+
+            if (sourceColorParticles) {
+                let clr = RIVER_COLORS[p.sourceIdx % RIVER_COLORS.length];
+                ctx.fillStyle = `rgb(${clr[0]},${clr[1]},${clr[2]})`;
+            } else {
+                ctx.fillStyle = '#fff';
+            }
+            ctx.globalAlpha = opacity;
+        }
+
+        if (radius < 0.1) continue;
+        const d = radius * 2;
+        ctx.fillRect(p.x - radius, p.y - radius, d, d);
+    }
+    ctx.globalAlpha = 1.0;
 
     // Reset per-frame mouse displacement accumulators (after particles have read them)
     mouse.frameDX = 0;
@@ -1143,7 +1120,11 @@ function animate() {
     }
 
     // Debug overlay: dotted lines at vertical region boundaries (drawn on separate canvas)
-    overlayCtx.clearRect(0, 0, width, height);
+    const overlayActive = debugOverlay || wetnessOverlay || erosionOverlay || riverSampleMode;
+    if (overlayActive || _prevOverlayActive) {
+        overlayCtx.clearRect(0, 0, width, height);
+    }
+    _prevOverlayActive = overlayActive;
     if (debugOverlay) {
         overlayCtx.save();
         overlayCtx.setLineDash([8, 6]);
@@ -1168,32 +1149,19 @@ function animate() {
             overlayCtx.fillText(r.label, 8, r.y + 4);
         }
 
-        // Draw mouse push pill
+        // Draw mouse push circle
         if (mouse.active) {
-            let halfLength = 90;
-            let halfWidth = 10;
-            let perpX = -mouse.dirY;
-            let perpY = mouse.dirX;
-            // Draw pill shape: two semicircles connected by lines
+            let pushRadius = 50;
             overlayCtx.setLineDash(mouse.middleDown ? [] : [4, 4]);
             overlayCtx.strokeStyle = mouse.middleDown ? 'rgba(255, 100, 100, 0.9)' : 'rgba(255, 100, 100, 0.6)';
             overlayCtx.lineWidth = 1;
-            // Endpoints of the center line segment
-            let ax = mouse.x + perpX * halfLength;
-            let ay = mouse.y + perpY * halfLength;
-            let bx = mouse.x - perpX * halfLength;
-            let by = mouse.y - perpY * halfLength;
-            // Angle of the perpendicular axis
-            let angle = Math.atan2(perpY, perpX);
             overlayCtx.beginPath();
-            overlayCtx.arc(ax, ay, halfWidth, angle - Math.PI / 2, angle + Math.PI / 2);
-            overlayCtx.arc(bx, by, halfWidth, angle + Math.PI / 2, angle + Math.PI / 2 + Math.PI);
-            overlayCtx.closePath();
+            overlayCtx.arc(mouse.x, mouse.y, pushRadius, 0, Math.PI * 2);
             overlayCtx.stroke();
             overlayCtx.fillStyle = 'rgba(255, 100, 100, 0.05)';
             overlayCtx.fill();
             overlayCtx.fillStyle = '#ff6464';
-            overlayCtx.fillText('Push pill (100x20)', mouse.x + halfLength + 15, mouse.y - 5);
+            overlayCtx.fillText('Push circle (r=50)', mouse.x + pushRadius + 10, mouse.y - 5);
         }
 
         // River detection overlay
@@ -1542,12 +1510,6 @@ canvas.addEventListener('mousemove', (e) => {
     let dy = e.clientY - mouse.y;
     mouse.frameDX += dx;
     mouse.frameDY += dy;
-    // Update target direction when mouse is moving
-    let len = Math.sqrt(dx * dx + dy * dy);
-    if (len > 1) {
-        mouse.targetDirX = dx / len;
-        mouse.targetDirY = dy / len;
-    }
     mouse.x = e.clientX;
     mouse.y = e.clientY;
     mouse.active = true;

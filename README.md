@@ -1,20 +1,30 @@
 # Generative River Flow
 
-A beautiful generative art project mimicking the natural formation of rivers and lakes over time.
+A generative art simulation of natural river formation, erosion, and capillary branching — rendered in real time with vanilla HTML5 Canvas.
 
 ![Example Animation](demo.webp)
 
 ## Overview
-This project simulates natural water flow physics using thousands of individual particles. It integrates:
-*   **Fractional Brownian Motion (fBm)** generated via Simplex Noise to create a shifting landscape.
-*   **Fluid Dynamics** such as pooling and draining to form natural-looking lakes.
-*   **Particle Trails** that persist dynamically and evaporate slowly to mimic established, deep riverbeds and streams.
+
+Thousands of particles trace paths through a shifting noise-based flow field, depositing wetness and erosion as they go. Over time, rivers self-organize into branching networks with capillary tributaries, pooling deltas, and persistent trail marks.
+
+Key techniques:
+- **Fractional Brownian Motion (fBm)** via Simplex Noise for the underlying terrain
+- **Wetness and erosion grids** that accumulate over time and influence particle behavior
+- **Capillary pheromone trails** that attract nearby particles into branching tributaries
+- **Mouse interaction** — cursor acts as a flow source with burst mechanics
 
 ## How to Run
-This is a vanilla web application with zero local build dependencies. Simply open `index.html` in your favorite web browser to view the animation.
 
-Enjoy the tranquil flow!
+No build step required. Open `index.html` in any modern browser.
 
-# Campbell's Notes
+## Keyboard Controls
 
-This was an experiment using Antigravity to see if I could recreate some idea I had for essentially what is a screensaver, and this was the result, which I'm fairly happy with!
+| Key | Action |
+|-----|--------|
+| `D` | Toggle debug overlay (flow field, origins) |
+| `W` | Toggle wetness heatmap |
+| `E` | Toggle erosion heatmap |
+| `T` | Toggle transparent particles |
+| `C` | Toggle source-colored particles |
+| `R` | River sample mode (drag to select region) |

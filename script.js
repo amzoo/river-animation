@@ -23,7 +23,7 @@ let riverSampleStats = null;       // computed stats object, displayed on overla
 
 // --- Overall Simulation ---
 // Number of particles spawned in the simulation
-const NUM_PARTICLES = 16000;
+const NUM_PARTICLES = 20000;
 const BURST_COUNT = 200;
 // Fraction of particles dedicated to the delta zone (reset when they leave it)
 const SOURCE_PARTICLE_FRACTION = 0.25;
@@ -88,7 +88,8 @@ const FADE_SLOW_AMOUNT = 1;
 const FADE_FAST_AMOUNT = 6;
 
 // --- Capillary Ants ---
-const CAPILLARY_FRACTION = 0.30;
+const CAPILLARY_DIVERT_RADIUS = 20;
+const CAPILLARY_DIVERT_FRACTION = 0.15;
 const CAPILLARY_LATERAL_FORCE = 1.2;
 const CAPILLARY_GRAVITY = 0.4;
 const CAPILLARY_MAX_OPACITY = 0.8;
@@ -117,6 +118,10 @@ const RIVER_REPULSE_STRENGTH = 0.4;  // multiplier for cross-gap repulsion
 
 // ==========================================
 
+let lastFrameTime = performance.now();
+let smoothFPS = 60;
+let simSpeed = 1;
+
 let mouse = { x: 0, y: 0, prevX: 0, prevY: 0, frameDX: 0, frameDY: 0, dirX: 0, dirY: 1, targetDirX: 0, targetDirY: 1, speed: 0, active: false, middleDown: false, lastTime: 0 };
 let burst = { charging: false, x: 0, y: 0, startTime: 0 };
 const BURST_MIN_RADIUS = 50;
@@ -131,6 +136,7 @@ let capWetnessGrid;
 let capErosionGrid;
 let capOwnerGrid;
 let capOwnerStr;
+let capFadeMask;
 let riverGrid = null;           // Uint8Array, flat [row * riverGridCols + col] → 1 if bright
 let riverLabels = null;         // Int32Array, flat → component ID (0 = inactive)
 let riverGridCols = 0;
@@ -173,6 +179,7 @@ function resize() {
     capErosionGrid = new Float32Array(cols * rows);
     capOwnerGrid = new Int8Array(cols * rows);
     capOwnerStr  = new Float32Array(cols * rows);
+    capFadeMask  = new Uint8Array(cols * rows);
 
     // River detection grid covering transition zone to bottom of canvas
     let rzYStart = Math.floor(height * TRANSITION_ZONE_END);
@@ -453,6 +460,31 @@ class Particle {
             return;
         }
 
+        // Capillary diversion: non-source river particles near a capillary origin
+        // may fork off into capillary mode
+        if (!this.isSource) {
+            for (let o of capillaryOrigins) {
+                let cdx = this.x - o.x;
+                let cdy = this.y - o.y;
+                let dist2 = cdx * cdx + cdy * cdy;
+                if (dist2 < CAPILLARY_DIVERT_RADIUS * CAPILLARY_DIVERT_RADIUS) {
+                    if (Math.random() < CAPILLARY_DIVERT_FRACTION) {
+                        this.isCapillary = true;
+                        this.capillaryDir = o.leftOk && !o.rightOk ? -1 : (!o.leftOk && o.rightOk ? 1 : (Math.random() < 0.5 ? -1 : 1));
+                        this.streamId = o.sourceIdx * 2 + (this.capillaryDir > 0 ? 1 : 0) + 1;
+                        this.capillaryOriginY = o.y;
+                        this.sourceIdx = o.sourceIdx;
+                        this.age = 0;
+                        this.capillaryWiggleSeed = Math.random() * Math.PI * 2;
+                        this.capillaryWiggleFreq = 0.04 + Math.random() * 0.06;
+                        this.drawOpacity = CAPILLARY_MAX_OPACITY;
+                        return;
+                    }
+                    break;
+                }
+            }
+        }
+
         // Fluid characteristics:
         // Particles near the top (delta zone) are always visible and don't decay fast,
         // even when spread thin, so deltas can form before streams converge.
@@ -464,7 +496,7 @@ class Particle {
         let inStream = cellWetness >= WETNESS_DRY_THRESHOLD;
 
         if (!inStream && !inDelta && !inTransition && !this.isSource) {
-            this.age += 4; // Small stray strands dry up / get absorbed rapidly
+            this.age += 2; // Small stray strands dry up / get absorbed rapidly
             // Fade out based on age — stray particles become invisible over time
             let ageFade = 1.0 - Math.min(this.age / (this.life * 0.3), 1.0);
             this.drawOpacity = MAX_DRAW_OPACITY * 0.15 * ageFade;
@@ -496,71 +528,16 @@ class Particle {
 
         // Reset if out of bounds or too old
         if (this.x < -50 || this.x > width + 50 || this.y > height + 50 || this.age > this.life) {
-            if (this.isSpawned) {
-                this.dead = true;
-                return;
-            }
             this.reset();
         }
     }
 
-    _resetCapillary() {
-        if (capillaryOrigins.length === 0) { this._parkCapillary(); return; }
-        let oi = Math.floor(Math.random() * capillaryOrigins.length);
-        let origin = capillaryOrigins[oi];
-        if (origin.leftOk && origin.rightOk) {
-            this.capillaryDir = Math.random() < 0.5 ? -1 : 1;
-        } else if (origin.leftOk) {
-            this.capillaryDir = -1;
-        } else {
-            this.capillaryDir = 1;
-        }
-        this.streamId = origin.sourceIdx * 2 + (this.capillaryDir > 0 ? 1 : 0) + 1;
-        this.x = origin.x + this.capillaryDir * (2 + Math.random() * 4);
-        this.y = origin.y + (Math.random() - 0.5) * 2;
-        this.sourceIdx = origin.sourceIdx;
-        this.capillaryOriginY = origin.y;
-        this.vx = 0;
-        this.vy = 0;
-        this.age = 0;
-        this.capillaryFading = 0;
-        this.capillaryAbsorbed = 0;
-        this.drawOpacity = 0;
-        this.capillaryWiggleSeed = Math.random() * Math.PI * 2;
-        this.capillaryWiggleFreq = 0.04 + Math.random() * 0.06;
-    }
-
-    _parkCapillary() {
-        this.x = -9999;
-        this.y = -9999;
-        this.vx = 0;
-        this.vy = 0;
-        this.capillaryParked = 0;
-        this.drawOpacity = 0;
+    _revertToRiver() {
+        this.isCapillary = false;
+        this.reset();
     }
 
     _updateCapillary() {
-        // Parked: count down delay then respawn
-        if (this.x <= -9000) {
-            this.capillaryParked--;
-            if (this.capillaryParked <= 0) {
-                this._resetCapillary();
-            }
-            return;
-        }
-
-        // Fading out: count down then re-park
-        if (this.capillaryFading > 0) {
-            this.capillaryFading--;
-            this.drawOpacity = CAPILLARY_MAX_OPACITY * (this.capillaryFading / 30);
-            if (this.capillaryFading <= 0) { this._parkCapillary(); return; }
-            this.x += this.vx;
-            this.y += this.vy;
-            this.vx *= 0.9;
-            this.vy *= 0.9;
-            return;
-        }
-
         this.age++;
 
         // Varicose wiggle: sinusoidal oscillation orthogonal to travel direction
@@ -662,7 +639,7 @@ class Particle {
         let fadeIn = Math.min(this.age / 20, 1.0);
         this.drawOpacity = CAPILLARY_MAX_OPACITY * fadeIn;
 
-        // River absorption: capillary converts to river particle
+        // River absorption: revert to river particle on contact
         {
             let rzYStart = Math.floor(height * TRANSITION_ZONE_END);
             let rr = Math.floor((this.y - rzYStart) / RIVER_CELL_SIZE);
@@ -670,40 +647,15 @@ class Particle {
             if (rr >= 0 && rr < riverGridRows && rc >= 0 && rc < riverGridCols) {
                 let lbl = riverLabels[rr * riverGridCols + rc];
                 if (lbl > 0) {
-                    // Convert this particle to river
-                    this.isCapillary = false;
-                    this.vx = 0;
-                    this.vy = 0;
-                    this.speed = Math.random() * PARTICLE_SPEED_VAR + PARTICLE_SPEED_BASE;
-                    this.weight = Math.random() * PARTICLE_WEIGHT_VAR + PARTICLE_WEIGHT_BASE;
-                    this.gravity = Math.random() * PARTICLE_GRAVITY_VAR + PARTICLE_GRAVITY_BASE;
-                    this.life = Math.random() * PARTICLE_LIFE_VAR + PARTICLE_LIFE_BASE;
-                    this.age = 0;
-                    this.drawOpacity = 0;
-                    this.stagnation = 0;
-
-                    // Spawn replacement capillary
-                    let rep = new Particle();
-                    rep.isCapillary = true;
-                    rep.isSource = false;
-                    rep.isSpawned = true;
-                    rep._parkCapillary();
-                    particles.push(rep);
-
+                    this._revertToRiver();
                     return;
                 }
             }
         }
 
-        // Foreign stream: no longer fades — river absorption handles it
-
-        // OOB check
+        // OOB check — revert to river
         if (this.x < -50 || this.x > width + 50 || this.y < -50 || this.y > height + 50) {
-            if (this.isSpawned) {
-                this.dead = true;
-                return;
-            }
-            this._parkCapillary();
+            this._revertToRiver();
         }
     }
 
@@ -730,7 +682,6 @@ class Particle {
             }
             let thickness = Math.min(capW / 6.0, 1.0);
             let radius = 0.8 + thickness * (CAPILLARY_MAX_RADIUS - 0.8);
-            if (this.capillaryFading > 0) radius *= this.capillaryFading / 30;
             if (radius < 0.1) radius = 0.1;
             ctx.arc(this.x, this.y, radius, 0, Math.PI * 2);
             ctx.fill();
@@ -754,18 +705,10 @@ class Particle {
 }
 
 const SOURCE_COUNT = Math.floor(NUM_PARTICLES * SOURCE_PARTICLE_FRACTION);
-const CAPILLARY_COUNT = Math.floor(NUM_PARTICLES * CAPILLARY_FRACTION);
 for (let i = 0; i < NUM_PARTICLES; i++) {
     let p = new Particle();
-    if (i >= NUM_PARTICLES - CAPILLARY_COUNT) {
-        p.isCapillary = true;
-        p.isSource = false;
-        p._parkCapillary();
-        p.capillaryParked = Math.floor(Math.random() * 60);
-    } else {
-        p.isCapillary = false;
-        p.isSource = i < SOURCE_COUNT;
-    }
+    p.isCapillary = false;
+    p.isSource = i < SOURCE_COUNT;
     particles.push(p);
 }
 
@@ -978,7 +921,7 @@ function updateRiverGrid() {
     }
 
     // Filter out small components (fewer than 20 cells)
-    const MIN_RIVER_CELLS = 300;
+    const MIN_RIVER_CELLS = 100;
     for (let i = 0; i < label; i++) {
         if (comps[i].count < MIN_RIVER_CELLS) {
             let lbl = i + 1;
@@ -1080,49 +1023,62 @@ function updateRiverGrid() {
     }
     for (let key of prevCapillaryOriginKeys) {
         if (!currentKeys.has(key)) {
-            // This origin disappeared — clear its grid band
+            // This origin disappeared — mark its grid band for accelerated fade
             let originY = key % 100000;
-            let originSrc = Math.floor(key / 100000);
             let rCenter = Math.floor(originY / GRID_SIZE);
             let rMin = Math.max(0, rCenter - 20);
             let rMax = Math.min(rows - 1, rCenter + 20);
             for (let gr = rMin; gr <= rMax; gr++) {
                 let rowOff = gr * cols;
                 for (let gc = 0; gc < cols; gc++) {
-                    capWetnessGrid[rowOff + gc] = 0;
-                    capErosionGrid[rowOff + gc] = 0;
-                    capOwnerGrid[rowOff + gc] = 0;
-                    capOwnerStr[rowOff + gc] = 0;
+                    capFadeMask[rowOff + gc] = 1;
                 }
             }
-            // Park capillary particles that belonged to this origin
-            for (let p of particles) {
-                if (p.isCapillary && p.sourceIdx === originSrc &&
-                    Math.round(p.capillaryOriginY) === originY) {
-                    p._parkCapillary();
-                }
-            }
+
         }
     }
     prevCapillaryOriginKeys = currentKeys;
 }
 
 function animate() {
-    // Evaporate wetness grid and slowly decay erosion
-    for (let k = 0; k < wetnessGrid.length; k++) {
-        wetnessGrid[k] *= EVAPORATION_RATE;
-        erosionGrid[k] *= EROSION_DECAY;
-        capWetnessGrid[k] *= CAP_EVAPORATION_RATE;
-        capErosionGrid[k] *= CAP_EROSION_DECAY;
-        capOwnerStr[k] *= CAP_EVAPORATION_RATE;
-        if (capOwnerStr[k] < 0.01) { capOwnerGrid[k] = 0; capOwnerStr[k] = 0; }
+    let now = performance.now();
+    let dt = now - lastFrameTime;
+    lastFrameTime = now;
+    if (dt > 0) smoothFPS = smoothFPS * 0.95 + (1000 / dt) * 0.05;
+
+    for (let tick = 0; tick < simSpeed; tick++) {
+        // Evaporate wetness grid and slowly decay erosion
+        for (let k = 0; k < wetnessGrid.length; k++) {
+            wetnessGrid[k] *= EVAPORATION_RATE;
+            erosionGrid[k] *= EROSION_DECAY;
+            if (capFadeMask[k]) {
+                // Accelerated decay for disappeared origins
+                capWetnessGrid[k] *= 0.90;
+                capErosionGrid[k] *= 0.95;
+                capOwnerStr[k] *= 0.90;
+                if (capWetnessGrid[k] < 0.01 && capErosionGrid[k] < 0.01) {
+                    capFadeMask[k] = 0;
+                    capOwnerGrid[k] = 0;
+                    capOwnerStr[k] = 0;
+                }
+            } else {
+                capWetnessGrid[k] *= CAP_EVAPORATION_RATE;
+                capErosionGrid[k] *= CAP_EROSION_DECAY;
+                capOwnerStr[k] *= CAP_EVAPORATION_RATE;
+            }
+            if (capOwnerStr[k] < 0.01) { capOwnerGrid[k] = 0; capOwnerStr[k] = 0; }
+        }
+
+        // Grid-based river detection (transition zone to bottom)
+        updateRiverGrid();
+
+        for (let i = 0; i < particles.length; i++) {
+            particles[i].update();
+        }
     }
 
-    // Grid-based river detection (transition zone to bottom)
-    updateRiverGrid();
-
-    // Instead of using fillRect with a very low opacity (which gets stuck  
-    // before true black due to browser 8-bit color rounding), we manually 
+    // Instead of using fillRect with a very low opacity (which gets stuck
+    // before true black due to browser 8-bit color rounding), we manually
     // decrement the pixel values directly to ensure trails persist for a long time
     // but ALWAYS steadily reach true black eventually.
 
@@ -1153,13 +1109,8 @@ function animate() {
         ctx.restore();
     }
 
-    for (let i = particles.length - 1; i >= 0; i--) {
-        particles[i].update();
-        if (particles[i].dead) {
-            particles.splice(i, 1);
-        } else {
-            particles[i].draw();
-        }
+    for (let i = 0; i < particles.length; i++) {
+        particles[i].draw();
     }
 
     // Smoothly interpolate pill direction toward target
@@ -1329,7 +1280,7 @@ function animate() {
         overlayCtx.font = '12px monospace';
         overlayCtx.fillStyle = '#aaaaaa';
         overlayCtx.fillText('Left click: hold to charge burst | Middle click: drag to push particles', 18, height - 32);
-        overlayCtx.fillText('D: debug | W: wetness | E: erosion | T: transparent | C: source colors | R: river sample', 18, height - 14);
+        overlayCtx.fillText('D: debug | W: wetness | E: erosion | T: transparent | C: source colors | R: river sample | P: stats | \u2191\u2193: speed', 18, height - 14);
 
         overlayCtx.restore();
     }
@@ -1531,7 +1482,7 @@ function animate() {
     // Particle statistics overlay
     if (particleStatsOverlay) {
         let total = particles.length;
-        let river = 0, capillary = 0, capParked = 0, capFading = 0, source = 0, spawned = 0;
+        let river = 0, capillary = 0, source = 0;
         let onCanvas = 0, offCanvas = 0;
         for (let p of particles) {
             if (p.x >= 0 && p.x <= width && p.y >= 0 && p.y <= height) {
@@ -1541,22 +1492,19 @@ function animate() {
             }
             if (p.isCapillary) {
                 capillary++;
-                if (p.x <= -9000) capParked++;
-                else if (p.capillaryFading > 0) capFading++;
             } else {
                 river++;
                 if (p.isSource) source++;
-                if (p.isSpawned) spawned++;
             }
         }
-        let capActive = capillary - capParked - capFading;
         let lines = [
             `PARTICLE STATS (P to hide)`,
             ``,
             `Total: ${total}  (on canvas: ${onCanvas}, off: ${offCanvas})`,
-            `River: ${river}  (source: ${source}, spawned: ${spawned})`,
-            `Capillary: ${capillary}  (active: ${capActive}, parked: ${capParked}, fading: ${capFading})`,
+            `River: ${river}  (source: ${source})`,
+            `Capillary: ${capillary}`,
             `Origins: ${capillaryOrigins.length}`,
+            `FPS: ${smoothFPS.toFixed(1)}  Speed: ${simSpeed}x (Up/Down)`,
         ];
         let lineH = 16;
         let panelW = 420;
@@ -1662,6 +1610,8 @@ window.addEventListener('keydown', (e) => {
     if (e.key === 'p' || e.key === 'P') particleStatsOverlay = !particleStatsOverlay;
     if (e.key === 't' || e.key === 'T') transparentParticles = !transparentParticles;
     if (e.key === 'c' || e.key === 'C') sourceColorParticles = !sourceColorParticles;
+    if (e.key === 'ArrowUp') simSpeed = Math.min(simSpeed + 1, 5);
+    if (e.key === 'ArrowDown') simSpeed = Math.max(simSpeed - 1, 1);
     if (e.key === 'r' || e.key === 'R') {
         riverSampleMode = !riverSampleMode;
         if (!riverSampleMode) {

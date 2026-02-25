@@ -10,6 +10,7 @@ let debugOverlay = false; // Toggle with 'D' key
 let wetnessOverlay = false; // Toggle with 'W' key
 let erosionOverlay = false; // Toggle with 'E' key
 let transparentParticles = false; // Toggle with 'T' key
+let sourceColorParticles = false; // Toggle with 'C' key
 let riverSampleMode = false;       // toggled by 'R' key
 let riverSampleRect = null;        // {x, y, w, h} in pixels — the selected rectangle
 let riverSampleDragging = false;   // true while mouse is held down to size the rect
@@ -88,7 +89,7 @@ const FADE_FAST_AMOUNT = 3;
 // --- Zone Boundaries ---
 const DELTA_ZONE_END = 0.30;
 const TRANSITION_ZONE_END = 0.40;
-const RIVER_CELL_SIZE = 8;
+const RIVER_CELL_SIZE = 3;
 
 // --- River gap detection (particle-level repulsion) ---
 const RIVER_GAP_THRESHOLD = 2.0;    // wetness below this = dry gap
@@ -113,8 +114,6 @@ let riverGridCols = 0;
 let riverGridRows = 0;
 let numRiverComponents = 0;
 let riverComponentColors = [];  // per-component color index, stable across frames
-let prevRiverComps = [];        // previous frame's component info for tracking
-let nextRiverColorIdx = 0;
 
 const simplex = new SimplexNoise();
 
@@ -182,7 +181,9 @@ class Particle {
 
     reset() {
         // Spawn from a random fixed source point with wide delta spread
-        const src = sourcePoints[Math.floor(Math.random() * sourcePoints.length)];
+        const srcI = Math.floor(Math.random() * sourcePoints.length);
+        const src = sourcePoints[srcI];
+        this.sourceIdx = srcI;
         this.x = src + (Math.random() - 0.5) * 120;
         this.y = -Math.random() * 30;
         // Reset age for source particles so they stay fresh
@@ -453,7 +454,12 @@ class Particle {
         if (this.drawOpacity <= MIN_DRAW_OPACITY) return;
 
         let opacity = transparentParticles ? this.drawOpacity * 0.1 : this.drawOpacity;
-        ctx.fillStyle = `rgba(255, 255, 255, ${opacity})`;
+        if (sourceColorParticles) {
+            let clr = RIVER_COLORS[this.sourceIdx % RIVER_COLORS.length];
+            ctx.fillStyle = `rgba(${clr[0]}, ${clr[1]}, ${clr[2]}, ${opacity})`;
+        } else {
+            ctx.fillStyle = `rgba(255, 255, 255, ${opacity})`;
+        }
         ctx.beginPath();
         let radius = this.weight * 1.5 * (Math.sin((this.age / this.life) * Math.PI));
         if (this.inDelta) radius = Math.max(radius, 1.5);
@@ -649,16 +655,8 @@ function updateRiverGrid() {
             } else if (aboveLabels.size === 1) {
                 assignLabel = aboveLabels.values().next().value;
             } else {
-                // Merge: pick the label with the most cells (largest river)
-                let bestLabel = 0;
-                let bestSize = -1;
-                for (let lbl of aboveLabels) {
-                    if (labelSize[lbl] > bestSize) {
-                        bestSize = labelSize[lbl];
-                        bestLabel = lbl;
-                    }
-                }
-                assignLabel = bestLabel;
+                // Merge: pick the lowest label number (deterministic, stable across frames)
+                assignLabel = Math.min(...aboveLabels);
             }
 
             let runLen = endC - startC + 1;
@@ -686,44 +684,48 @@ function updateRiverGrid() {
         }
     }
 
-    // Match new components to previous frame's by column overlap, keeping largest component's color on merge
-    riverComponentColors = new Array(label).fill(-1);
-    let usedPrev = new Set();
+    // Filter out small components (fewer than 20 cells)
+    const MIN_RIVER_CELLS = 350;
     for (let i = 0; i < label; i++) {
-        let bestOverlap = 0;
-        let bestPrevs = []; // all previous components that overlap this one
-        for (let pi = 0; pi < prevRiverComps.length; pi++) {
-            if (usedPrev.has(pi)) continue;
-            let overlap = 0;
-            for (let col of comps[i].cols) {
-                if (prevRiverComps[pi].cols.has(col)) overlap++;
+        if (comps[i].count < MIN_RIVER_CELLS) {
+            let lbl = i + 1;
+            for (let r = 0; r < riverGridRows; r++) {
+                for (let c = 0; c < riverGridCols; c++) {
+                    if (riverLabels[r * riverGridCols + c] === lbl) {
+                        riverLabels[r * riverGridCols + c] = 0;
+                    }
+                }
             }
-            if (overlap > 0) bestPrevs.push({ pi, overlap, count: prevRiverComps[pi].count, colorIdx: prevRiverComps[pi].colorIdx });
+            comps[i].count = 0;
+            comps[i].cols.clear();
         }
-        if (bestPrevs.length > 0) {
-            // Pick color from the previous component with the most cells (largest river)
-            bestPrevs.sort((a, b) => b.count - a.count);
-            riverComponentColors[i] = bestPrevs[0].colorIdx;
-            for (let bp of bestPrevs) usedPrev.add(bp.pi);
-        }
-    }
-    // Assign new colors to unmatched components, ordered by minRow (highest first gets next color)
-    let unmatched = [];
-    for (let i = 0; i < label; i++) {
-        if (riverComponentColors[i] === -1) unmatched.push(i);
-    }
-    unmatched.sort((a, b) => comps[a].minRow - comps[b].minRow);
-    for (let i of unmatched) {
-        riverComponentColors[i] = nextRiverColorIdx++;
     }
 
-    // Store for next frame
-    prevRiverComps = comps.map((ci, i) => ({
-        minRow: ci.minRow,
-        count: ci.count,
-        cols: ci.cols,
-        colorIdx: riverComponentColors[i]
-    }));
+    // Build source set per component from particle positions
+    let compSources = new Array(label);
+    for (let i = 0; i < label; i++) compSources[i] = new Set();
+
+    for (let p of particles) {
+        let pr = Math.floor((p.y - rzYStart) / RIVER_CELL_SIZE);
+        let pc = Math.floor(p.x / RIVER_CELL_SIZE);
+        if (pr < 0 || pr >= riverGridRows || pc < 0 || pc >= riverGridCols) continue;
+        let lbl = riverLabels[pr * riverGridCols + pc];
+        if (lbl > 0 && p.sourceIdx >= 0) {
+            compSources[lbl - 1].add(p.sourceIdx);
+        }
+    }
+
+    // Assign color from lowest sourceIdx
+    riverComponentColors = new Array(label).fill(-1);
+    for (let i = 0; i < label; i++) {
+        if (compSources[i].size > 0) {
+            riverComponentColors[i] = Math.min(...compSources[i]);
+        }
+    }
+    // Fallback for components with no particles
+    for (let i = 0; i < label; i++) {
+        if (riverComponentColors[i] === -1) riverComponentColors[i] = 0;
+    }
 }
 
 function animate() {
@@ -895,7 +897,7 @@ function animate() {
                 let cy = gridYStart + (ci.sumR / ci.count + 0.5) * RIVER_CELL_SIZE;
                 let clr = RIVER_COLORS[riverComponentColors[i] % RIVER_COLORS.length];
                 overlayCtx.fillStyle = `rgb(${clr[0]}, ${clr[1]}, ${clr[2]})`;
-                overlayCtx.fillText(`R${riverComponentColors[i] + 1}`, cx - 8, cy);
+                overlayCtx.fillText(`S${riverComponentColors[i] + 1}`, cx - 8, cy);
             }
             overlayCtx.textBaseline = 'top';
         }
@@ -929,7 +931,7 @@ function animate() {
         overlayCtx.fillRect(0, height - 24, width, 24);
         overlayCtx.font = '12px monospace';
         overlayCtx.fillStyle = '#aaaaaa';
-        overlayCtx.fillText('D: debug | W: wetness | E: erosion | T: transparent | R: river sample', 18, height - 18);
+        overlayCtx.fillText('D: debug | W: wetness | E: erosion | T: transparent | C: source colors | R: river sample', 18, height - 18);
 
         overlayCtx.restore();
     }
@@ -1157,6 +1159,7 @@ window.addEventListener('keydown', (e) => {
     if (e.key === 'w' || e.key === 'W') wetnessOverlay = !wetnessOverlay;
     if (e.key === 'e' || e.key === 'E') erosionOverlay = !erosionOverlay;
     if (e.key === 't' || e.key === 'T') transparentParticles = !transparentParticles;
+    if (e.key === 'c' || e.key === 'C') sourceColorParticles = !sourceColorParticles;
     if (e.key === 'r' || e.key === 'R') {
         riverSampleMode = !riverSampleMode;
         if (!riverSampleMode) {

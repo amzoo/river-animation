@@ -90,12 +90,13 @@ const FADE_FAST_AMOUNT = 3;
 const CAPILLARY_FRACTION = 0.15;
 const CAPILLARY_LATERAL_FORCE = 2.5;
 const CAPILLARY_GRAVITY = 0.14;
-const CAPILLARY_MAX_OPACITY = 0.18;
-const CAPILLARY_MAX_RADIUS = 1.0;
+const CAPILLARY_MAX_OPACITY = 0.35;
+const CAPILLARY_MAX_RADIUS = 1.4;
 const CAPILLARY_PHEROMONE_DEPOSIT = 0.4;
 const CAPILLARY_PHEROMONE_ATTRACT = 0.15;
 const CAPILLARY_PHEROMONE_EVAP = 0.997;
 const CAPILLARY_TARGET_WETNESS = 3.0;
+const CAPILLARY_WIGGLE_STRENGTH = 0.25;
 
 // --- Zone Boundaries ---
 const DELTA_ZONE_END = 0.30;
@@ -499,6 +500,8 @@ class Particle {
         this.age = 0;
         this.capillaryFading = 0;
         this.drawOpacity = 0;
+        this.capillaryWiggleSeed = Math.random() * Math.PI * 2;
+        this.capillaryWiggleFreq = 0.04 + Math.random() * 0.06;
     }
 
     _parkCapillary() {
@@ -537,6 +540,9 @@ class Particle {
         this.vx += n * 0.3;
         this.vy += (fbm(this.x * 0.005 + 100, this.y * 0.005, zOff * 0.5)) * 0.15;
 
+        // Varicose wiggle: sinusoidal vertical oscillation keyed to lateral travel
+        this.vy += Math.sin(this.x * this.capillaryWiggleFreq + this.capillaryWiggleSeed) * CAPILLARY_WIGGLE_STRENGTH;
+
         // Strong lateral force
         this.vx += this.capillaryDir * CAPILLARY_LATERAL_FORCE * 0.1;
 
@@ -545,7 +551,7 @@ class Particle {
 
         // Vertical cohesion: pull toward origin row
         let rowDiff = this.capillaryOriginY - this.y;
-        this.vy += rowDiff * 0.002;
+        this.vy += rowDiff * 0.001;
 
         // Pheromone following: scan ahead in move direction
         let c = Math.floor(this.x / GRID_SIZE);
@@ -618,6 +624,23 @@ class Particle {
         let fadeIn = Math.min(this.age / 20, 1.0);
         this.drawOpacity = CAPILLARY_MAX_OPACITY * fadeIn;
 
+        // Foreign stream detection: rapid decay when hitting another source's river
+        if (this.age > 15) {
+            let rzYStart = Math.floor(height * TRANSITION_ZONE_END);
+            let rr = Math.floor((this.y - rzYStart) / RIVER_CELL_SIZE);
+            let rc = Math.floor(this.x / RIVER_CELL_SIZE);
+            if (rr >= 0 && rr < riverGridRows && rc >= 0 && rc < riverGridCols) {
+                let lbl = riverLabels[rr * riverGridCols + rc];
+                if (lbl > 0) {
+                    let compSource = riverComponentColors[lbl - 1];
+                    if (compSource >= 0 && compSource !== this.sourceIdx) {
+                        this.capillaryFading = 10;
+                        return;
+                    }
+                }
+            }
+        }
+
         // OOB check
         if (this.x < -50 || this.x > width + 50 || this.y < -50 || this.y > height + 50 || this.age > 600) {
             this._parkCapillary();
@@ -629,7 +652,9 @@ class Particle {
 
         if (this.isCapillary) {
             let opacity = this.drawOpacity;
-            if (sourceColorParticles) {
+            if (debugOverlay) {
+                ctx.fillStyle = `rgba(255, 60, 60, ${Math.min(opacity * 2, 1)})`;
+            } else if (sourceColorParticles) {
                 let clr = RIVER_COLORS[this.sourceIdx % RIVER_COLORS.length];
                 ctx.fillStyle = `rgba(${clr[0]}, ${clr[1]}, ${clr[2]}, ${opacity})`;
             } else {
@@ -1012,8 +1037,8 @@ function animate() {
 
         // Subtle blur pass to soften accumulated trail edges
         ctx.save();
-        ctx.filter = 'blur(0.8px)';
-        ctx.globalAlpha = 0.6;
+        ctx.filter = 'blur(0.6px)';
+        ctx.globalAlpha = 0.5;
         ctx.drawImage(canvas, 0, 0);
         ctx.restore();
     }
@@ -1110,17 +1135,55 @@ function animate() {
         let gridYStart = Math.floor(height * TRANSITION_ZONE_END);
         overlayCtx.setLineDash([]);
         if (riverLabels && numRiverComponents > 0) {
-            // Draw colored cells for each component using tracked colors
+            // Draw colored cells for each component — saturated debug palette keyed to source index
+            const DEBUG_COMP_COLORS = [
+                'rgba(255,80,80,0.7)',   // Red
+                'rgba(0,220,130,0.7)',   // Green
+                'rgba(60,140,255,0.7)',  // Blue
+                'rgba(220,100,255,0.7)', // Purple
+                'rgba(255,200,0,0.7)',   // Yellow
+                'rgba(0,210,210,0.7)',   // Cyan
+                'rgba(255,130,40,0.7)',  // Orange
+            ];
             for (let r = 0; r < riverGridRows; r++) {
                 for (let c = 0; c < riverGridCols; c++) {
                     let lbl = riverLabels[r * riverGridCols + c];
                     if (lbl > 0) {
-                        let clr = RIVER_COLORS[riverComponentColors[lbl - 1] % RIVER_COLORS.length];
-                        overlayCtx.fillStyle = `rgba(${clr[0]}, ${clr[1]}, ${clr[2]}, 0.35)`;
+                        overlayCtx.fillStyle = DEBUG_COMP_COLORS[riverComponentColors[lbl - 1] % DEBUG_COMP_COLORS.length];
                         overlayCtx.fillRect(c * RIVER_CELL_SIZE, gridYStart + r * RIVER_CELL_SIZE, RIVER_CELL_SIZE, RIVER_CELL_SIZE);
                     }
                 }
             }
+
+            // Draw white outline around each component group
+            overlayCtx.strokeStyle = 'rgba(255, 255, 255, 0.8)';
+            overlayCtx.lineWidth = 1;
+            overlayCtx.beginPath();
+            for (let r = 0; r < riverGridRows; r++) {
+                for (let c = 0; c < riverGridCols; c++) {
+                    let lbl = riverLabels[r * riverGridCols + c];
+                    if (lbl <= 0) continue;
+                    let px = c * RIVER_CELL_SIZE;
+                    let py = gridYStart + r * RIVER_CELL_SIZE;
+                    // Top edge
+                    if (r === 0 || riverLabels[(r - 1) * riverGridCols + c] !== lbl) {
+                        overlayCtx.moveTo(px, py); overlayCtx.lineTo(px + RIVER_CELL_SIZE, py);
+                    }
+                    // Bottom edge
+                    if (r === riverGridRows - 1 || riverLabels[(r + 1) * riverGridCols + c] !== lbl) {
+                        overlayCtx.moveTo(px, py + RIVER_CELL_SIZE); overlayCtx.lineTo(px + RIVER_CELL_SIZE, py + RIVER_CELL_SIZE);
+                    }
+                    // Left edge
+                    if (c === 0 || riverLabels[r * riverGridCols + c - 1] !== lbl) {
+                        overlayCtx.moveTo(px, py); overlayCtx.lineTo(px, py + RIVER_CELL_SIZE);
+                    }
+                    // Right edge
+                    if (c === riverGridCols - 1 || riverLabels[r * riverGridCols + c + 1] !== lbl) {
+                        overlayCtx.moveTo(px + RIVER_CELL_SIZE, py); overlayCtx.lineTo(px + RIVER_CELL_SIZE, py + RIVER_CELL_SIZE);
+                    }
+                }
+            }
+            overlayCtx.stroke();
 
             // Compute centroids and label each component
             let centroids = new Array(numRiverComponents);
@@ -1144,8 +1207,12 @@ function animate() {
                 let cx = (ci.sumC / ci.count + 0.5) * RIVER_CELL_SIZE;
                 let cy = gridYStart + (ci.sumR / ci.count + 0.5) * RIVER_CELL_SIZE;
                 let clr = RIVER_COLORS[riverComponentColors[i] % RIVER_COLORS.length];
+                let label = `S${riverComponentColors[i] + 1}`;
+                overlayCtx.strokeStyle = 'white';
+                overlayCtx.lineWidth = 3;
+                overlayCtx.strokeText(label, cx - 8, cy);
                 overlayCtx.fillStyle = `rgb(${clr[0]}, ${clr[1]}, ${clr[2]})`;
-                overlayCtx.fillText(`S${riverComponentColors[i] + 1}`, cx - 8, cy);
+                overlayCtx.fillText(label, cx - 8, cy);
             }
             overlayCtx.textBaseline = 'top';
         }
@@ -1186,12 +1253,13 @@ function animate() {
         overlayCtx.font = '12px monospace';
         overlayCtx.fillText(`River grid: ${numRiverComponents} component(s)`, 8, gridYStart - 8);
 
-        // Keyboard help bar at bottom
+        // Help bars at bottom
         overlayCtx.fillStyle = 'rgba(0, 0, 0, 0.6)';
-        overlayCtx.fillRect(0, height - 24, width, 24);
+        overlayCtx.fillRect(0, height - 42, width, 42);
         overlayCtx.font = '12px monospace';
         overlayCtx.fillStyle = '#aaaaaa';
-        overlayCtx.fillText('D: debug | W: wetness | E: erosion | T: transparent | C: source colors | R: river sample', 18, height - 18);
+        overlayCtx.fillText('Left click: hold to charge burst | Middle click: drag to push particles', 18, height - 32);
+        overlayCtx.fillText('D: debug | W: wetness | E: erosion | T: transparent | C: source colors | R: river sample', 18, height - 14);
 
         overlayCtx.restore();
     }

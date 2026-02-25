@@ -170,7 +170,8 @@ window.addEventListener('resize', resize);
 resize();
 
 const RIVER_COLORS = [[0,204,204],[204,68,255],[68,255,204],[255,204,68],[255,68,204],[68,136,255],[255,136,68],[136,255,68]];
-const RIVER_BRIGHTNESS_THRESHOLD = 64; // min pixel brightness (0-255) to count as river
+const RIVER_BRIGHTNESS_THRESHOLD = 64; // min pixel brightness (0-255) for debug analysis
+const RIVER_WETNESS_THRESHOLD = 5.0; // min wetness value to count as river
 
 class Particle {
     constructor() {
@@ -581,31 +582,30 @@ function updateRiverGrid() {
     riverGridFrame++;
     if (riverGridFrame % 3 !== 0) return; // throttle to every 3rd frame
 
-    let yStart = Math.floor(height * TRANSITION_ZONE_END);
-    let zoneH = height - yStart;
+    let rzYStart = Math.floor(height * TRANSITION_ZONE_END);
+    let zoneH = height - rzYStart;
     if (zoneH <= 0 || riverGridCols === 0 || riverGridRows === 0) return;
 
-    let imgData = ctx.getImageData(0, yStart, width, zoneH);
-    let data = imgData.data;
-
-    // Mark cells: average red channel over each cell's pixel area
+    // Downsample wetness grid directly instead of reading back pixels
     riverGrid.fill(0);
     for (let r = 0; r < riverGridRows; r++) {
-        let pyStart = r * RIVER_CELL_SIZE;
-        let pyEnd = Math.min(pyStart + RIVER_CELL_SIZE, zoneH);
+        let pyStart = rzYStart + r * RIVER_CELL_SIZE;
+        let pyEnd = Math.min(pyStart + RIVER_CELL_SIZE, height);
+        let wRowStart = Math.floor(pyStart / GRID_SIZE);
+        let wRowEnd = Math.min(Math.ceil(pyEnd / GRID_SIZE), rows);
         for (let c = 0; c < riverGridCols; c++) {
             let pxStart = c * RIVER_CELL_SIZE;
             let pxEnd = Math.min(pxStart + RIVER_CELL_SIZE, width);
-            let sum = 0;
-            let count = 0;
-            for (let py = pyStart; py < pyEnd; py++) {
-                let rowOff = py * width * 4;
-                for (let px = pxStart; px < pxEnd; px++) {
-                    sum += data[rowOff + px * 4]; // red channel
-                    count++;
+            let wColStart = Math.floor(pxStart / GRID_SIZE);
+            let wColEnd = Math.min(Math.ceil(pxEnd / GRID_SIZE), cols);
+            let maxW = 0;
+            for (let wr = wRowStart; wr < wRowEnd; wr++) {
+                for (let wc = wColStart; wc < wColEnd; wc++) {
+                    let w = wetnessGrid[wr * cols + wc];
+                    if (w > maxW) maxW = w;
                 }
             }
-            if (count > 0 && (sum / count) >= RIVER_BRIGHTNESS_THRESHOLD) {
+            if (maxW >= RIVER_WETNESS_THRESHOLD) {
                 riverGrid[r * riverGridCols + c] = 1;
             }
         }
@@ -613,10 +613,11 @@ function updateRiverGrid() {
 
     // Row-by-row top-down label propagation
     // Rivers that merge keep distinct colors above the merge point;
-    // below the merge, cells take the label of the highest (smallest minRow) parent.
+    // below the merge, cells take the label of the largest (most cells) parent.
     riverLabels.fill(0);
     let label = 0;
     let labelMinRow = [0]; // 1-indexed: labelMinRow[lbl] = row where lbl first appeared
+    let labelSize = [0];   // 1-indexed: labelSize[lbl] = number of cells assigned to lbl
 
     for (let r = 0; r < riverGridRows; r++) {
         // Find runs of contiguous active cells in this row
@@ -644,21 +645,24 @@ function updateRiverGrid() {
             if (aboveLabels.size === 0) {
                 assignLabel = ++label;
                 labelMinRow.push(r);
+                labelSize.push(0);
             } else if (aboveLabels.size === 1) {
                 assignLabel = aboveLabels.values().next().value;
             } else {
-                // Merge: pick the label that started highest on the canvas
+                // Merge: pick the label with the most cells (largest river)
                 let bestLabel = 0;
-                let bestMinRow = riverGridRows;
+                let bestSize = -1;
                 for (let lbl of aboveLabels) {
-                    if (labelMinRow[lbl] < bestMinRow) {
-                        bestMinRow = labelMinRow[lbl];
+                    if (labelSize[lbl] > bestSize) {
+                        bestSize = labelSize[lbl];
                         bestLabel = lbl;
                     }
                 }
                 assignLabel = bestLabel;
             }
 
+            let runLen = endC - startC + 1;
+            labelSize[assignLabel] += runLen;
             for (let c = startC; c <= endC; c++) {
                 riverLabels[r * riverGridCols + c] = assignLabel;
             }
@@ -682,7 +686,7 @@ function updateRiverGrid() {
         }
     }
 
-    // Match new components to previous frame's by column overlap, keeping higher component's color on merge
+    // Match new components to previous frame's by column overlap, keeping largest component's color on merge
     riverComponentColors = new Array(label).fill(-1);
     let usedPrev = new Set();
     for (let i = 0; i < label; i++) {
@@ -694,11 +698,11 @@ function updateRiverGrid() {
             for (let col of comps[i].cols) {
                 if (prevRiverComps[pi].cols.has(col)) overlap++;
             }
-            if (overlap > 0) bestPrevs.push({ pi, overlap, minRow: prevRiverComps[pi].minRow, colorIdx: prevRiverComps[pi].colorIdx });
+            if (overlap > 0) bestPrevs.push({ pi, overlap, count: prevRiverComps[pi].count, colorIdx: prevRiverComps[pi].colorIdx });
         }
         if (bestPrevs.length > 0) {
-            // Pick color from the previous component with the smallest minRow (highest on canvas)
-            bestPrevs.sort((a, b) => a.minRow - b.minRow);
+            // Pick color from the previous component with the most cells (largest river)
+            bestPrevs.sort((a, b) => b.count - a.count);
             riverComponentColors[i] = bestPrevs[0].colorIdx;
             for (let bp of bestPrevs) usedPrev.add(bp.pi);
         }
@@ -716,6 +720,7 @@ function updateRiverGrid() {
     // Store for next frame
     prevRiverComps = comps.map((ci, i) => ({
         minRow: ci.minRow,
+        count: ci.count,
         cols: ci.cols,
         colorIdx: riverComponentColors[i]
     }));

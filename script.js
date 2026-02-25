@@ -87,7 +87,7 @@ const FADE_SLOW_AMOUNT = 1;
 const FADE_FAST_AMOUNT = 3;
 
 // --- Capillary Ants ---
-const CAPILLARY_FRACTION = 0.06;
+const CAPILLARY_FRACTION = 0.15;
 const CAPILLARY_LATERAL_FORCE = 2.5;
 const CAPILLARY_GRAVITY = 0.14;
 const CAPILLARY_MAX_OPACITY = 0.18;
@@ -1003,17 +1003,6 @@ function animate() {
         ctx.globalAlpha = 0.6;
         ctx.drawImage(canvas, 0, 0);
         ctx.restore();
-    }
-
-    // Draw capillary pheromone trails
-    for (let r = 0; r < rows; r++) {
-        for (let c = 0; c < cols; c++) {
-            let phero = capillaryGrid[r * cols + c];
-            if (phero < 0.3) continue;
-            let alpha = Math.min(phero / 8.0, 0.45);
-            ctx.fillStyle = `rgba(255, 255, 255, ${alpha})`;
-            ctx.fillRect(c * GRID_SIZE, r * GRID_SIZE, GRID_SIZE, GRID_SIZE);
-        }
     }
 
     for (let i = 0; i < particles.length; i++) {

@@ -114,6 +114,8 @@ let riverGridCols = 0;
 let riverGridRows = 0;
 let numRiverComponents = 0;
 let riverComponentColors = [];  // per-component color index, stable across frames
+let capillaryHeights = [];  // Array of {y, sourceIdx} — computed once in resize()
+let capillaryOrigins = [];  // Array of {x, y, sourceIdx} — x updated each river frame
 
 const simplex = new SimplexNoise();
 
@@ -158,6 +160,17 @@ function resize() {
         const spacing = (width - 2 * margin) / (NUM_SOURCES - 1);
         for (let i = 0; i < NUM_SOURCES; i++) {
             sourcePoints.push(margin + i * spacing);
+        }
+    }
+
+    // Generate fixed capillary origin heights for each source
+    capillaryHeights = [];
+    for (let s = 0; s < sourcePoints.length; s++) {
+        let startY = height * (TRANSITION_ZONE_END + (s % 2 === 0 ? 0.10 : 0.05));
+        let y = startY;
+        while (y < height) {
+            capillaryHeights.push({ y: y, sourceIdx: s });
+            y += height * (0.10 + Math.random() * 0.05);
         }
     }
 
@@ -685,7 +698,7 @@ function updateRiverGrid() {
     }
 
     // Filter out small components (fewer than 20 cells)
-    const MIN_RIVER_CELLS = 350;
+    const MIN_RIVER_CELLS = 300;
     for (let i = 0; i < label; i++) {
         if (comps[i].count < MIN_RIVER_CELLS) {
             let lbl = i + 1;
@@ -701,9 +714,9 @@ function updateRiverGrid() {
         }
     }
 
-    // Build source set per component from particle positions
-    let compSources = new Array(label);
-    for (let i = 0; i < label; i++) compSources[i] = new Set();
+    // Count particles per source per component
+    let compSourceCounts = new Array(label);
+    for (let i = 0; i < label; i++) compSourceCounts[i] = {};
 
     for (let p of particles) {
         let pr = Math.floor((p.y - rzYStart) / RIVER_CELL_SIZE);
@@ -711,20 +724,67 @@ function updateRiverGrid() {
         if (pr < 0 || pr >= riverGridRows || pc < 0 || pc >= riverGridCols) continue;
         let lbl = riverLabels[pr * riverGridCols + pc];
         if (lbl > 0 && p.sourceIdx >= 0) {
-            compSources[lbl - 1].add(p.sourceIdx);
+            let counts = compSourceCounts[lbl - 1];
+            counts[p.sourceIdx] = (counts[p.sourceIdx] || 0) + 1;
         }
     }
 
-    // Assign color from lowest sourceIdx
+    // Assign color from majority sourceIdx
     riverComponentColors = new Array(label).fill(-1);
     for (let i = 0; i < label; i++) {
-        if (compSources[i].size > 0) {
-            riverComponentColors[i] = Math.min(...compSources[i]);
+        let counts = compSourceCounts[i];
+        let bestSrc = -1, bestCnt = 0;
+        for (let s in counts) {
+            if (counts[s] > bestCnt) { bestCnt = counts[s]; bestSrc = +s; }
         }
+        if (bestSrc >= 0) riverComponentColors[i] = bestSrc;
     }
     // Fallback for components with no particles
     for (let i = 0; i < label; i++) {
         if (riverComponentColors[i] === -1) riverComponentColors[i] = 0;
+    }
+
+    // Update capillary origin x-positions from active river components
+    capillaryOrigins = [];
+
+    // Collect which component each sourceIdx belongs to
+    let sourceToComp = new Array(sourcePoints.length).fill(-1);
+    for (let i = 0; i < label; i++) {
+        let majorSrc = riverComponentColors[i];
+        if (majorSrc >= 0) {
+            sourceToComp[majorSrc] = i;
+        }
+    }
+
+    // Build per-source row centroid lookups
+    let rzYStart_px = Math.floor(height * TRANSITION_ZONE_END);
+    let sourceCentroids = new Array(sourcePoints.length).fill(null);
+    for (let s = 0; s < sourcePoints.length; s++) {
+        let ci = sourceToComp[s];
+        if (ci === -1) continue;
+        let compLabel = ci + 1;
+        let rowCentroids = {};
+        for (let r = 0; r < riverGridRows; r++) {
+            let sumC = 0, cnt = 0;
+            for (let c = 0; c < riverGridCols; c++) {
+                if (riverLabels[r * riverGridCols + c] === compLabel) {
+                    sumC += c;
+                    cnt++;
+                }
+            }
+            if (cnt > 0) rowCentroids[r] = (sumC / cnt + 0.5) * RIVER_CELL_SIZE;
+        }
+        sourceCentroids[s] = rowCentroids;
+    }
+
+    // Map pre-computed heights to current x-positions
+    for (let h of capillaryHeights) {
+        let centroids = sourceCentroids[h.sourceIdx];
+        if (!centroids) continue;
+        let r = Math.floor((h.y - rzYStart_px) / RIVER_CELL_SIZE);
+        if (r >= 0 && r < riverGridRows && centroids[r] !== undefined) {
+            capillaryOrigins.push({ x: centroids[r], y: h.y, sourceIdx: h.sourceIdx });
+        }
     }
 }
 
@@ -900,6 +960,18 @@ function animate() {
                 overlayCtx.fillText(`S${riverComponentColors[i] + 1}`, cx - 8, cy);
             }
             overlayCtx.textBaseline = 'top';
+        }
+
+        // Draw capillary origins
+        for (let co of capillaryOrigins) {
+            let clr = RIVER_COLORS[co.sourceIdx % RIVER_COLORS.length];
+            overlayCtx.fillStyle = `rgb(${clr[0]}, ${clr[1]}, ${clr[2]})`;
+            overlayCtx.beginPath();
+            overlayCtx.arc(co.x, co.y, 4, 0, Math.PI * 2);
+            overlayCtx.fill();
+            overlayCtx.strokeStyle = 'white';
+            overlayCtx.lineWidth = 1;
+            overlayCtx.stroke();
         }
 
         // Thin grid lines over transition zone

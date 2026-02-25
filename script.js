@@ -86,6 +86,17 @@ const FADE_SLOW_AMOUNT = 1;
 // How much RGB to subtract when path drops below threshold (fast fade)
 const FADE_FAST_AMOUNT = 3;
 
+// --- Capillary Ants ---
+const CAPILLARY_FRACTION = 0.06;
+const CAPILLARY_LATERAL_FORCE = 2.5;
+const CAPILLARY_GRAVITY = 0.14;
+const CAPILLARY_MAX_OPACITY = 0.18;
+const CAPILLARY_MAX_RADIUS = 1.0;
+const CAPILLARY_PHEROMONE_DEPOSIT = 0.4;
+const CAPILLARY_PHEROMONE_ATTRACT = 0.15;
+const CAPILLARY_PHEROMONE_EVAP = 0.997;
+const CAPILLARY_TARGET_WETNESS = 3.0;
+
 // --- Zone Boundaries ---
 const DELTA_ZONE_END = 0.30;
 const TRANSITION_ZONE_END = 0.40;
@@ -108,6 +119,7 @@ let zOff = 0;
 let cols, rows;
 let wetnessGrid;
 let erosionGrid;
+let capillaryGrid;
 let riverGrid = null;           // Uint8Array, flat [row * riverGridCols + col] → 1 if bright
 let riverLabels = null;         // Int32Array, flat → component ID (0 = inactive)
 let riverGridCols = 0;
@@ -145,6 +157,7 @@ function resize() {
     rows = Math.ceil(height / GRID_SIZE);
     wetnessGrid = new Float32Array(cols * rows);
     erosionGrid = new Float32Array(cols * rows);
+    capillaryGrid = new Float32Array(cols * rows);
 
     // River detection grid covering transition zone to bottom of canvas
     let rzYStart = Math.floor(height * TRANSITION_ZONE_END);
@@ -170,7 +183,7 @@ function resize() {
         let y = startY;
         while (y < height) {
             capillaryHeights.push({ y: y, sourceIdx: s });
-            y += height * (0.10 + Math.random() * 0.05);
+            y += height * (0.20 + Math.random() * 0.10);
         }
     }
 
@@ -214,6 +227,7 @@ class Particle {
     }
 
     update() {
+        if (this.isCapillary) { this._updateCapillary(); return; }
         // Calculate noise gradient
         const n1 = fbm(this.x * NOISE_SCALE, this.y * NOISE_SCALE, zOff);
         const nx = fbm((this.x + NOISE_EPSILON) * NOISE_SCALE, this.y * NOISE_SCALE, zOff);
@@ -463,8 +477,160 @@ class Particle {
         }
     }
 
+    _resetCapillary() {
+        if (capillaryOrigins.length === 0) { this._parkCapillary(); return; }
+        let oi = Math.floor(Math.random() * capillaryOrigins.length);
+        let origin = capillaryOrigins[oi];
+        this.capillaryDir = Math.random() < 0.5 ? -1 : 1;
+        this.x = origin.x + this.capillaryDir * (2 + Math.random() * 4);
+        this.y = origin.y + (Math.random() - 0.5) * 6;
+        this.sourceIdx = origin.sourceIdx;
+        this.capillaryOriginY = origin.y;
+        this.vx = 0;
+        this.vy = 0;
+        this.age = 0;
+        this.capillaryFading = 0;
+        this.drawOpacity = 0;
+    }
+
+    _parkCapillary() {
+        this.x = -9999;
+        this.y = -9999;
+        this.vx = 0;
+        this.vy = 0;
+        this.capillaryParked = 30 + Math.floor(Math.random() * 60);
+        this.drawOpacity = 0;
+    }
+
+    _updateCapillary() {
+        // Parked: count down then respawn
+        if (this.capillaryParked > 0) {
+            this.capillaryParked--;
+            if (this.capillaryParked <= 0) this._resetCapillary();
+            return;
+        }
+
+        // Fading out: count down then re-park
+        if (this.capillaryFading > 0) {
+            this.capillaryFading--;
+            this.drawOpacity = CAPILLARY_MAX_OPACITY * (this.capillaryFading / 30);
+            if (this.capillaryFading <= 0) { this._parkCapillary(); return; }
+            this.x += this.vx;
+            this.y += this.vy;
+            this.vx *= 0.9;
+            this.vy *= 0.9;
+            return;
+        }
+
+        this.age++;
+
+        // FBM noise for organic movement
+        let n = fbm(this.x * 0.005, this.y * 0.005, zOff * 0.5);
+        this.vx += n * 0.3;
+        this.vy += (fbm(this.x * 0.005 + 100, this.y * 0.005, zOff * 0.5)) * 0.15;
+
+        // Strong lateral force
+        this.vx += this.capillaryDir * CAPILLARY_LATERAL_FORCE * 0.1;
+
+        // Gentle gravity
+        this.vy += CAPILLARY_GRAVITY;
+
+        // Vertical cohesion: pull toward origin row
+        let rowDiff = this.capillaryOriginY - this.y;
+        this.vy += rowDiff * 0.002;
+
+        // Pheromone following: scan ahead in move direction
+        let c = Math.floor(this.x / GRID_SIZE);
+        let r = Math.floor(this.y / GRID_SIZE);
+        if (c >= 0 && c < cols && r >= 0 && r < rows) {
+            let idx = c + r * cols;
+
+            // Deposit pheromone and wetness
+            capillaryGrid[idx] += CAPILLARY_PHEROMONE_DEPOSIT;
+            wetnessGrid[idx] += 0.05;
+
+            // Scan ±5 cells in lateral direction for pheromone gradient
+            let pullY = 0;
+            let dir = this.capillaryDir > 0 ? 1 : -1;
+            for (let s = 1; s <= 5; s++) {
+                let sc = c + dir * s;
+                if (sc < 0 || sc >= cols) break;
+                // Check rows above and below for pheromone
+                for (let dr = -2; dr <= 2; dr++) {
+                    let sr = r + dr;
+                    if (sr < 0 || sr >= rows) continue;
+                    let phero = capillaryGrid[sc + sr * cols];
+                    if (phero > 0.1) {
+                        pullY += dr * phero * CAPILLARY_PHEROMONE_ATTRACT / (s * s);
+                    }
+                }
+            }
+            this.vy += pullY;
+
+            // Arrival detection: if age > 30 and cell wetness >= target and far from origin
+            let cellWetness = wetnessGrid[idx];
+            let distFromOrigin = Math.abs(c - Math.floor(capillaryOrigins.length > 0 ? capillaryOrigins[0].x / GRID_SIZE : c));
+            let rowsFromOrigin = Math.abs(r - Math.floor(this.capillaryOriginY / GRID_SIZE));
+            if (this.age > 30 && cellWetness >= CAPILLARY_TARGET_WETNESS && rowsFromOrigin < 5) {
+                // Check we've moved laterally enough
+                let originC = Math.floor((this.x - this.capillaryDir * this.age * 0.5) / GRID_SIZE);
+                let lateralDist = Math.abs(c - originC);
+                if (lateralDist > 10) {
+                    this.capillaryFading = 30;
+                    return;
+                }
+            }
+        }
+
+        // Friction and velocity clamping
+        this.vx *= 0.92;
+        this.vy *= 0.92;
+        let spd = Math.sqrt(this.vx * this.vx + this.vy * this.vy);
+        if (spd > 3.0) {
+            this.vx = (this.vx / spd) * 3.0;
+            this.vy = (this.vy / spd) * 3.0;
+        }
+
+        this.x += this.vx;
+        this.y += this.vy;
+
+        // Mouse pill displacement
+        if (mouse.active && mouse.middleDown && (mouse.frameDX !== 0 || mouse.frameDY !== 0)) {
+            let mdx = this.x - mouse.x;
+            let mdy = this.y - mouse.y;
+            let dist = Math.sqrt(mdx * mdx + mdy * mdy);
+            if (dist < 20) {
+                let falloff = 1.0 - dist / 20;
+                this.x += mouse.frameDX * falloff;
+                this.y += mouse.frameDY * falloff;
+            }
+        }
+
+        // Opacity: fade in over first 20 frames
+        let fadeIn = Math.min(this.age / 20, 1.0);
+        this.drawOpacity = CAPILLARY_MAX_OPACITY * fadeIn;
+
+        // OOB check
+        if (this.x < -50 || this.x > width + 50 || this.y < -50 || this.y > height + 50 || this.age > 600) {
+            this._parkCapillary();
+        }
+    }
+
     draw() {
         if (this.drawOpacity <= MIN_DRAW_OPACITY) return;
+
+        if (this.isCapillary) {
+            let opacity = this.drawOpacity;
+            ctx.fillStyle = `rgba(255, 255, 255, ${opacity})`;
+            ctx.beginPath();
+            let fadeIn = Math.min(this.age / 20, 1.0);
+            let radius = CAPILLARY_MAX_RADIUS * fadeIn;
+            if (this.capillaryFading > 0) radius *= this.capillaryFading / 30;
+            if (radius < 0.1) radius = 0.1;
+            ctx.arc(this.x, this.y, radius, 0, Math.PI * 2);
+            ctx.fill();
+            return;
+        }
 
         let opacity = transparentParticles ? this.drawOpacity * 0.1 : this.drawOpacity;
         if (sourceColorParticles) {
@@ -483,9 +649,17 @@ class Particle {
 }
 
 const SOURCE_COUNT = Math.floor(NUM_PARTICLES * SOURCE_PARTICLE_FRACTION);
+const CAPILLARY_COUNT = Math.floor(NUM_PARTICLES * CAPILLARY_FRACTION);
 for (let i = 0; i < NUM_PARTICLES; i++) {
     let p = new Particle();
-    p.isSource = i < SOURCE_COUNT;
+    if (i >= NUM_PARTICLES - CAPILLARY_COUNT) {
+        p.isCapillary = true;
+        p.isSource = false;
+        p._parkCapillary();
+    } else {
+        p.isCapillary = false;
+        p.isSource = i < SOURCE_COUNT;
+    }
     particles.push(p);
 }
 
@@ -793,6 +967,7 @@ function animate() {
     for (let k = 0; k < wetnessGrid.length; k++) {
         wetnessGrid[k] *= EVAPORATION_RATE;
         erosionGrid[k] *= EROSION_DECAY;
+        capillaryGrid[k] *= CAPILLARY_PHEROMONE_EVAP;
     }
 
     // Grid-based river detection (transition zone to bottom)
@@ -828,6 +1003,17 @@ function animate() {
         ctx.globalAlpha = 0.6;
         ctx.drawImage(canvas, 0, 0);
         ctx.restore();
+    }
+
+    // Draw capillary pheromone trails
+    for (let r = 0; r < rows; r++) {
+        for (let c = 0; c < cols; c++) {
+            let phero = capillaryGrid[r * cols + c];
+            if (phero < 0.3) continue;
+            let alpha = Math.min(phero / 8.0, 0.45);
+            ctx.fillStyle = `rgba(255, 255, 255, ${alpha})`;
+            ctx.fillRect(c * GRID_SIZE, r * GRID_SIZE, GRID_SIZE, GRID_SIZE);
+        }
     }
 
     for (let i = 0; i < particles.length; i++) {

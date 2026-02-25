@@ -194,7 +194,15 @@ function resize() {
 window.addEventListener('resize', resize);
 resize();
 
-const RIVER_COLORS = [[0,204,204],[204,68,255],[68,255,204],[255,204,68],[255,68,204],[68,136,255],[255,136,68],[136,255,68]];
+const RIVER_COLORS = [
+    [253,189,165],  // Coral
+    [130,253,209],  // Mint
+    [32,128,208],   // Blue
+    [191,157,220],  // Lilac
+    [45,187,105],   // Green
+    [160,216,255],  // Light Blue (original 226,242,255)
+    [200,255,232],  // Light Mint (original 235,255,248)
+];
 const RIVER_BRIGHTNESS_THRESHOLD = 64; // min pixel brightness (0-255) for debug analysis
 const RIVER_WETNESS_THRESHOLD = 5.0; // min wetness value to count as river
 
@@ -621,7 +629,12 @@ class Particle {
 
         if (this.isCapillary) {
             let opacity = this.drawOpacity;
-            ctx.fillStyle = `rgba(255, 255, 255, ${opacity})`;
+            if (sourceColorParticles) {
+                let clr = RIVER_COLORS[this.sourceIdx % RIVER_COLORS.length];
+                ctx.fillStyle = `rgba(${clr[0]}, ${clr[1]}, ${clr[2]}, ${opacity})`;
+            } else {
+                ctx.fillStyle = `rgba(255, 255, 255, ${opacity})`;
+            }
             ctx.beginPath();
             let fadeIn = Math.min(this.age / 20, 1.0);
             let radius = CAPILLARY_MAX_RADIUS * fadeIn;

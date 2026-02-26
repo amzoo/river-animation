@@ -271,7 +271,10 @@ const STATS_PANEL_PADDING     = 16;
 
 let lastFrameTime = performance.now();
 let smoothFPS = 60;
-let simSpeed = 1;
+const SIM_SPEED_STEPS = [0.1, 0.25, 0.5, 1, 2, 3, 4, 5];
+let simSpeedIndex = 3; // default 1x
+let simSpeed = SIM_SPEED_STEPS[simSpeedIndex];
+let simSpeedAccum = 0;
 
 let mouse = { x: 0, y: 0, prevX: 0, prevY: 0, frameDX: 0, frameDY: 0, speed: 0, active: false, leftDown: false, lastTime: 0, pushAngle: 0 };
 let burst = { charging: false, x: 0, y: 0, startTime: 0 };
@@ -1249,7 +1252,10 @@ function animate() {
         mouse.pushAngle += diff * lerp;
     }
 
-    for (let tick = 0; tick < simSpeed; tick++) {
+    simSpeedAccum += simSpeed;
+    let ticksThisFrame = Math.floor(simSpeedAccum);
+    simSpeedAccum -= ticksThisFrame;
+    for (let tick = 0; tick < ticksThisFrame; tick++) {
         // Evaporate wetness grid and slowly decay erosion
         for (let k = 0; k < wetnessGrid.length; k++) {
             wetnessGrid[k] *= EVAPORATION_RATE;
@@ -2031,8 +2037,8 @@ window.addEventListener('keydown', (e) => {
     if (e.key === 'c' || e.key === 'C') sourceColorParticles = !sourceColorParticles;
     if (e.key === 'b' || e.key === 'B') capillaryDiversion = !capillaryDiversion;
     if (e.key === 'm' || e.key === 'M') mixSources = !mixSources;
-    if (e.key === 'ArrowUp') simSpeed = Math.min(simSpeed + 1, 5);
-    if (e.key === 'ArrowDown') simSpeed = Math.max(simSpeed - 1, 1);
+    if (e.key === 'ArrowUp') { simSpeedIndex = Math.min(simSpeedIndex + 1, SIM_SPEED_STEPS.length - 1); simSpeed = SIM_SPEED_STEPS[simSpeedIndex]; }
+    if (e.key === 'ArrowDown') { simSpeedIndex = Math.max(simSpeedIndex - 1, 0); simSpeed = SIM_SPEED_STEPS[simSpeedIndex]; }
     if (e.key === 'r' || e.key === 'R') {
         riverSampleMode = !riverSampleMode;
         riverSampleStats = null;

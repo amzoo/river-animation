@@ -91,15 +91,11 @@ const FADE_SLOW_AMOUNT = 1;
 const FADE_FAST_AMOUNT = 6;
 
 // --- Capillary Ants ---
-const CAPILLARY_DIVERT_RADIUS = 20;
-const CAPILLARY_DIVERT_FRACTION = 0.40;
-const CAPILLARY_DIVERT_MIN_WETNESS = 8.0;
-const CAPILLARY_DIVERT_WETNESS_COMPENSATION = 3.0;
 const CAPILLARY_LATERAL_FORCE = 1.2;
 const CAPILLARY_GRAVITY = 0.4;
 const CAPILLARY_MAX_OPACITY = 0.8;
 const CAPILLARY_MAX_RADIUS = 1.4;
-const CAPILLARY_WIGGLE_STRENGTH = 0.08;
+const CAPILLARY_WIGGLE_STRENGTH = 0.20;
 
 // --- Capillary Wetness/Erosion (isolated grids) ---
 const CAP_WETNESS_DEPOSIT    = 0.15;
@@ -107,8 +103,8 @@ const CAP_EROSION_DEPOSIT    = 0.03;
 const CAP_EROSION_MAX        = 15.0;
 const CAP_EVAPORATION_RATE   = 0.985;
 const CAP_EROSION_DECAY      = 0.999;
-const CAP_SCAN_RADIUS        = 20;
-const CAP_EROSION_SPREAD     = 0.2;
+const CAP_SCAN_RADIUS        = 30;
+const CAP_EROSION_SPREAD     = 0.4;
 const CAP_ATTRACT_SCALE      = 0.15;
 
 // --- Zone Boundaries ---
@@ -122,12 +118,10 @@ const PUSH_ARC_RADIUS = 300;   // curvature radius (larger = flatter)
 const PUSH_ARC_SPAN   = 1.0;   // angular span in radians (~57 deg)
 const PUSH_PILL_RADIUS = 10;   // thickness around the arc
 
-const RIVER_GAP_THRESHOLD = 2.0;    // wetness below this = dry gap
-const RIVER_GAP_MIN_WIDTH = 3;      // consecutive dry cells to count as a gap
-const RIVER_REPULSE_STRENGTH = 0.4;  // multiplier for cross-gap repulsion
+const RIVER_REPULSE_STRENGTH = 6.0;  // multiplier for foreign-source repulsion
 
 // --- Sources & Spawning ---
-const NUM_SOURCES = 6;
+const NUM_SOURCES = 7;
 const SOURCE_MARGIN_RATIO = 0.1;
 const DELTA_SPAWN_WIDTH = 120;
 const SOURCE_SPAWN_HEIGHT = 30;
@@ -182,11 +176,13 @@ const CAPILLARY_DIVERSIONS_PER_FRAME = 3;
 const CAP_WIGGLE_FREQ_BASE   = 0.04;
 const CAP_WIGGLE_FREQ_VAR    = 0.06;
 const CAP_LATERAL_SCALE      = 0.4;
+const CAP_LATERAL_DECAY_DIST = 400;
 const CAP_VERTICAL_SCAN      = 2;
 const CAP_CHANNEL_THRESHOLD  = 0.1;
 const CAP_FRICTION           = 0.94;
 const CAP_MAX_SPEED          = 3.0;
 const CAP_FADE_IN_FRAMES     = 20;
+const MAX_RECYCLED_CAPILLARIES = 8000;
 
 // --- Capillary Origin Cleanup ---
 const CAP_ORIGIN_FADE_BAND     = 20;
@@ -291,6 +287,7 @@ let capErosionGrid;
 let capOwnerGrid;
 let capOwnerStr;
 let capFadeMask;
+let sourceOwnerGrid;  // Int8Array(cols * rows) — sourceIdx of last depositor, -1 = none
 let riverGrid = null;           // Uint8Array, flat [row * riverGridCols + col] → 1 if bright
 let riverLabels = null;         // Int32Array, flat → component ID (0 = inactive)
 let riverCellLastSeen = null;   // Float64Array, timestamp (ms) when cell last met thresholds
@@ -300,7 +297,9 @@ let numRiverComponents = 0;
 let riverComponentColors = [];  // per-component color index, stable across frames
 let capillaryHeights = [];  // Array of {y, sourceIdx} — computed once in resize()
 let capillaryOrigins = [];  // Array of {x, y, sourceIdx} — x updated each river frame
+let sourceCentroids = [];   // per-source row centroid lookups, updated each river frame
 let prevCapillaryOriginKeys = new Set();  // origin identity keys from previous frame
+let recycledCapillaryCount = 0;
 
 const simplex = new SimplexNoise();
 
@@ -335,6 +334,7 @@ function resize() {
     capOwnerGrid = new Int8Array(cols * rows);
     capOwnerStr  = new Float32Array(cols * rows);
     capFadeMask  = new Uint8Array(cols * rows);
+    sourceOwnerGrid = new Int8Array(cols * rows).fill(-1);
 
     // River detection grid covering transition zone to bottom of canvas
     let rzYStart = Math.floor(height * TRANSITION_ZONE_END);
@@ -356,7 +356,7 @@ function resize() {
     // Generate fixed capillary origin heights for each source
     capillaryHeights = [];
     for (let s = 0; s < sourcePoints.length; s++) {
-        let startY = height * (TRANSITION_ZONE_END + (s % 2 === 0 ? CAP_HEIGHT_START_EVEN : CAP_HEIGHT_START_ODD));
+        let startY = height * (TRANSITION_ZONE_END + (s % 2 === 1 ? CAP_HEIGHT_START_EVEN : CAP_HEIGHT_START_ODD));
         let y = startY;
         while (y < height) {
             capillaryHeights.push({ y: y, sourceIdx: s });
@@ -387,6 +387,7 @@ const RIVER_CELL_TIMEOUT = 5000;    // ms a river cell stays alive after thresho
 
 class Particle {
     constructor() {
+        this._recycled = false;
         this.reset();
         // Spread initial particles vertically so they don't all bunch at the top
         this.y = -Math.random() * height * DELTA_ZONE_END;
@@ -440,6 +441,7 @@ class Particle {
         if (c >= 0 && c < cols && r >= 0 && r < rows) {
             let idx = c + r * cols;
             wetnessGrid[idx] += WETNESS_DEPOSIT; // deposit water
+            sourceOwnerGrid[idx] = this.sourceIdx;
             cellWetness = wetnessGrid[idx];
 
             // Accumulate erosion where water flows (very slow, persistent)
@@ -460,46 +462,26 @@ class Particle {
                 let inPostTransition = this.y >= height * TRANSITION_ZONE_END;
 
                 // Scan left
-                let gapCount = 0, crossedGap = false;
                 for (let s = 1; s <= STREAM_SCAN_RADIUS; s++) {
                     if (c - s < 0) break;
                     let w = wetnessGrid[idx - s] + erosionGrid[idx - s] * EROSION_WEIGHT;
                     let distFalloff = 1.0 / (s * s);
-                    if (inPostTransition) {
-                        if (w < RIVER_GAP_THRESHOLD) {
-                            gapCount++;
-                            if (gapCount >= RIVER_GAP_MIN_WIDTH) crossedGap = true;
-                        } else {
-                            gapCount = 0;
-                        }
-                        if (crossedGap) {
-                            repulseLeft += w * distFalloff;
-                        } else {
-                            attractLeft += w * distFalloff;
-                        }
+                    if (inPostTransition && sourceOwnerGrid[idx - s] >= 0
+                        && sourceOwnerGrid[idx - s] !== this.sourceIdx) {
+                        repulseLeft += w * distFalloff;
                     } else {
                         attractLeft += w * distFalloff;
                     }
                 }
 
                 // Scan right
-                gapCount = 0; crossedGap = false;
                 for (let s = 1; s <= STREAM_SCAN_RADIUS; s++) {
                     if (c + s >= cols) break;
                     let w = wetnessGrid[idx + s] + erosionGrid[idx + s] * EROSION_WEIGHT;
                     let distFalloff = 1.0 / (s * s);
-                    if (inPostTransition) {
-                        if (w < RIVER_GAP_THRESHOLD) {
-                            gapCount++;
-                            if (gapCount >= RIVER_GAP_MIN_WIDTH) crossedGap = true;
-                        } else {
-                            gapCount = 0;
-                        }
-                        if (crossedGap) {
-                            repulseRight += w * distFalloff;
-                        } else {
-                            attractRight += w * distFalloff;
-                        }
+                    if (inPostTransition && sourceOwnerGrid[idx + s] >= 0
+                        && sourceOwnerGrid[idx + s] !== this.sourceIdx) {
+                        repulseRight += w * distFalloff;
                     } else {
                         attractRight += w * distFalloff;
                     }
@@ -597,43 +579,6 @@ class Particle {
             return;
         }
 
-        // Capillary diversion: non-source river particles near a capillary origin
-        // may fork off into capillary mode
-        if (!this.isSource && capillaryDiversion && riverZoneParticleCount > CAPILLARY_DIVERSION_THRESHOLD && frameDiversions < CAPILLARY_DIVERSIONS_PER_FRAME) {
-            for (let o of capillaryOrigins) {
-                let cdx = this.x - o.x;
-                let cdy = this.y - o.y;
-                let dist2 = cdx * cdx + cdy * cdy;
-                if (dist2 < CAPILLARY_DIVERT_RADIUS * CAPILLARY_DIVERT_RADIUS) {
-                    // Only divert if local river wetness is strong enough to sustain the loss
-                    let oc = Math.floor(o.x / GRID_SIZE);
-                    let or_ = Math.floor(o.y / GRID_SIZE);
-                    let localWetness = (oc >= 0 && oc < cols && or_ >= 0 && or_ < rows)
-                        ? wetnessGrid[oc + or_ * cols] : 0;
-                    if (localWetness < CAPILLARY_DIVERT_MIN_WETNESS) break;
-
-                    if (Math.random() < CAPILLARY_DIVERT_FRACTION) {
-                        frameDiversions++;
-                        this.isCapillary = true;
-                        this.capillaryDir = o.leftOk && !o.rightOk ? -1 : (!o.leftOk && o.rightOk ? 1 : (Math.random() < 0.5 ? -1 : 1));
-                        this.streamId = o.sourceIdx * 2 + (this.capillaryDir > 0 ? 1 : 0) + 1;
-                        this.capillaryOriginY = o.y;
-                        this.sourceIdx = o.sourceIdx;
-                        this.age = 0;
-                        this.capillaryWiggleSeed = Math.random() * Math.PI * 2;
-                        this.capillaryWiggleFreq = CAP_WIGGLE_FREQ_BASE + Math.random() * CAP_WIGGLE_FREQ_VAR;
-                        this.drawOpacity = CAPILLARY_MAX_OPACITY;
-                        // Compensate river wetness for the diverted particle
-                        if (oc >= 0 && oc < cols && or_ >= 0 && or_ < rows) {
-                            wetnessGrid[oc + or_ * cols] += CAPILLARY_DIVERT_WETNESS_COMPENSATION;
-                        }
-                        return;
-                    }
-                    break;
-                }
-            }
-        }
-
         // Fluid characteristics:
         // Particles near the top (delta zone) are always visible and don't decay fast,
         // even when spread thin, so deltas can form before streams converge.
@@ -681,16 +626,69 @@ class Particle {
         }
     }
 
-    _revertToRiver() {
-        this.isCapillary = false;
-        this.reset();
+    _recycleCapillary() {
+        if (this._recycled) recycledCapillaryCount--;
+
+        // Find matching origin in current capillaryOrigins
+        let bestDist2 = Infinity, bestOrigin = null;
+        for (let o of capillaryOrigins) {
+            if (o.sourceIdx !== this.sourceIdx) continue;
+            let dx = o.x - this.capillaryOriginX;
+            let dy = o.y - this.capillaryOriginY;
+            let d2 = dx * dx + dy * dy;
+            if (d2 < bestDist2) { bestDist2 = d2; bestOrigin = o; }
+        }
+        if (!bestOrigin || recycledCapillaryCount >= MAX_RECYCLED_CAPILLARIES) {
+            this.isCapillary = false;
+            this._recycled = false;
+            this.reset();
+            return;
+        }
+        recycledCapillaryCount++;
+        this._recycled = true;
+        this.x = bestOrigin.x;
+        this.y = bestOrigin.y;
+        this.capillaryOriginX = bestOrigin.x;
+        this.capillaryOriginY = bestOrigin.y;
+        this.capillaryAngle = bestOrigin.targetAngle;
+        this.capillaryDir = Math.cos(bestOrigin.targetAngle) >= 0 ? 1 : -1;
+        this.age = 0;
+        this.capillaryWiggleSeed = Math.random() * Math.PI * 2;
+        this.drawOpacity = 0;
+
+        // Channel-following: scan from origin for established capillary channels
+        let oc = Math.floor(bestOrigin.x / GRID_SIZE);
+        let or_ = Math.floor(bestOrigin.y / GRID_SIZE);
+        let dir = this.capillaryDir;
+        let bestPull = 0, bestDr = 0;
+        if (oc >= 0 && oc < cols && or_ >= 0 && or_ < rows) {
+            for (let s = 1; s <= CAP_SCAN_RADIUS; s++) {
+                let sc = oc + dir * s;
+                if (sc < 0 || sc >= cols) break;
+                for (let dr = -CAP_VERTICAL_SCAN; dr <= CAP_VERTICAL_SCAN; dr++) {
+                    let sr = or_ + dr;
+                    if (sr < 0 || sr >= rows) continue;
+                    let w = capWetnessGrid[sc + sr * cols] + capErosionGrid[sc + sr * cols] * EROSION_WEIGHT;
+                    if (w > bestPull) { bestPull = w; bestDr = dr; }
+                }
+            }
+        }
+        if (bestPull > CAP_CHANNEL_THRESHOLD) {
+            let outX = Math.cos(bestOrigin.targetAngle);
+            let outY = Math.sin(bestOrigin.targetAngle);
+            this.vx = outX * CAPILLARY_LATERAL_FORCE * CAP_LATERAL_SCALE;
+            this.vy = outY * CAPILLARY_LATERAL_FORCE * CAP_LATERAL_SCALE + bestDr * CAP_ATTRACT_SCALE;
+        } else {
+            this.vx = 0;
+            this.vy = 0;
+        }
     }
 
     _updateCapillary() {
         this.age++;
 
         // Varicose wiggle: sinusoidal oscillation orthogonal to travel direction
-        let wiggle = Math.sin(this.x * this.capillaryWiggleFreq + this.capillaryWiggleSeed) * CAPILLARY_WIGGLE_STRENGTH;
+        let wiggle = Math.sin(this.age * this.capillaryWiggleFreq + this.capillaryWiggleSeed) * CAPILLARY_WIGGLE_STRENGTH;
         let spd2 = this.vx * this.vx + this.vy * this.vy;
         if (spd2 > 0.01) {
             let inv = 1.0 / Math.sqrt(spd2);
@@ -702,10 +700,17 @@ class Particle {
             this.vy += wiggle;
         }
 
-        // Strong lateral force
-        this.vx += this.capillaryDir * CAPILLARY_LATERAL_FORCE * CAP_LATERAL_SCALE;
+        // Distance-decaying lateral force along perpendicular angle
+        let dx0 = this.x - this.capillaryOriginX;
+        let dy0 = this.y - this.capillaryOriginY;
+        let dist = Math.sqrt(dx0 * dx0 + dy0 * dy0);
+        let lateralFactor = Math.exp(-dist / CAP_LATERAL_DECAY_DIST);
+        let outX = Math.cos(this.capillaryAngle);
+        let outY = Math.sin(this.capillaryAngle);
+        this.vx += outX * CAPILLARY_LATERAL_FORCE * CAP_LATERAL_SCALE * lateralFactor;
+        this.vy += outY * CAPILLARY_LATERAL_FORCE * CAP_LATERAL_SCALE * lateralFactor;
 
-        // Gentle gravity
+        // Constant gravity
         this.vy += CAPILLARY_GRAVITY;
 
         // Capillary wetness/erosion feedback (isolated grids)
@@ -795,7 +800,7 @@ class Particle {
             if (rr >= 0 && rr < riverGridRows && rc >= 0 && rc < riverGridCols) {
                 let lbl = riverLabels[rr * riverGridCols + rc];
                 if (lbl > 0) {
-                    this._revertToRiver();
+                    this._recycleCapillary();
                     return;
                 }
             }
@@ -803,7 +808,7 @@ class Particle {
 
         // OOB check — revert to river
         if (this.x < -OOB_MARGIN || this.x > width + OOB_MARGIN || this.y < -OOB_MARGIN || this.y > height + OOB_MARGIN) {
-            this._revertToRiver();
+            this._recycleCapillary();
         }
     }
 
@@ -1104,7 +1109,7 @@ function updateRiverGrid() {
 
     // Build per-source row centroid lookups
     let rzYStart_px = Math.floor(height * TRANSITION_ZONE_END);
-    let sourceCentroids = new Array(sourcePoints.length).fill(null);
+    sourceCentroids = new Array(sourcePoints.length).fill(null);
     for (let s = 0; s < sourcePoints.length; s++) {
         let ci = sourceToComp[s];
         if (ci === -1) continue;
@@ -1123,24 +1128,61 @@ function updateRiverGrid() {
         sourceCentroids[s] = rowCentroids;
     }
 
-    // Map pre-computed heights to current x-positions
+    // Build all origin points for all sources (odd spawn, even are targets)
+    let allOrigins = [];  // { x, y, sourceIdx }
     for (let h of capillaryHeights) {
         let centroids = sourceCentroids[h.sourceIdx];
         if (!centroids) continue;
         let r = Math.floor((h.y - rzYStart_px) / RIVER_CELL_SIZE);
         if (r >= 0 && r < riverGridRows && centroids[r] !== undefined) {
-            let s = h.sourceIdx;
-            let leftOk = s > 0 && sourceToComp[s - 1] !== -1;
-            let rightOk = s < sourcePoints.length - 1 && sourceToComp[s + 1] !== -1;
-            if (!leftOk && !rightOk) continue;
-            capillaryOrigins.push({ x: centroids[r], y: h.y, sourceIdx: s, leftOk, rightOk });
+            allOrigins.push({ x: centroids[r], y: h.y, sourceIdx: h.sourceIdx });
+        }
+    }
+
+    // Group even-source origins by sourceIdx for fast neighbor lookup
+    let evenOrigins = {};
+    for (let o of allOrigins) {
+        if (o.sourceIdx % 2 === 0) {
+            if (!evenOrigins[o.sourceIdx]) evenOrigins[o.sourceIdx] = [];
+            evenOrigins[o.sourceIdx].push(o);
+        }
+    }
+
+    // For each odd-source origin, find nearest even neighbor and compute targetAngle
+    for (let o of allOrigins) {
+        if (o.sourceIdx % 2 !== 1) continue;  // only odd sources spawn capillaries
+        let s = o.sourceIdx;
+
+        // Check each even neighbor (s-1 and s+1)
+        let neighbors = [];
+        if (s > 0 && sourceToComp[s - 1] !== -1) neighbors.push(s - 1);
+        if (s < sourcePoints.length - 1 && sourceToComp[s + 1] !== -1) neighbors.push(s + 1);
+
+        for (let ni of neighbors) {
+            let targets = evenOrigins[ni];
+            if (!targets || targets.length === 0) continue;
+
+            // Find closest target by Y (same-Y targeting)
+            let bestDY = Infinity, bestTarget = null;
+            for (let t of targets) {
+                let dy = Math.abs(t.y - o.y);
+                if (dy < bestDY) { bestDY = dy; bestTarget = t; }
+            }
+            if (!bestTarget) continue;
+
+            let targetY = o.y + (Math.random() - 0.5) * 30;
+            let targetAngle = Math.atan2(targetY - o.y, bestTarget.x - o.x);
+            capillaryOrigins.push({
+                x: o.x, y: o.y, sourceIdx: s,
+                neighborIdx: ni, targetAngle: targetAngle
+            });
         }
     }
 
     // Detect disappeared origins and clear their capillary wetness/erosion bands
     let currentKeys = new Set();
     for (let o of capillaryOrigins) {
-        currentKeys.add(o.sourceIdx * 100000 + Math.round(o.y));
+        currentKeys.add(o.sourceIdx * 1000000 + o.neighborIdx * 100000 + Math.round(o.y));
     }
     for (let key of prevCapillaryOriginKeys) {
         if (!currentKeys.has(key)) {
@@ -1210,6 +1252,7 @@ function animate() {
         // Evaporate wetness grid and slowly decay erosion
         for (let k = 0; k < wetnessGrid.length; k++) {
             wetnessGrid[k] *= EVAPORATION_RATE;
+            if (wetnessGrid[k] < 0.1) sourceOwnerGrid[k] = -1;
             erosionGrid[k] *= EROSION_DECAY;
             if (capFadeMask[k]) {
                 // Accelerated decay for disappeared origins
@@ -1243,6 +1286,60 @@ function animate() {
         updateRiverGrid();
 
         frameDiversions = 0;
+
+        // Delta-zone diversion: grab random delta particles, teleport to capillary origins
+        if (capillaryDiversion && capillaryOrigins.length > 0 &&
+            riverZoneParticleCount > CAPILLARY_DIVERSION_THRESHOLD) {
+            for (let d = 0; d < CAPILLARY_DIVERSIONS_PER_FRAME; d++) {
+                let idx = Math.floor(Math.random() * particles.length);
+                let p = particles[idx];
+                if (p.isSource || p.isCapillary || p.y < 0 || p.y >= deltaEnd) continue;
+
+                let o = capillaryOrigins[Math.floor(Math.random() * capillaryOrigins.length)];
+                p.isCapillary = true;
+                p.x = o.x;
+                p.y = o.y;
+                p.capillaryDir = Math.cos(o.targetAngle) >= 0 ? 1 : -1;
+                p.streamId = o.sourceIdx * 2 + (p.capillaryDir > 0 ? 1 : 0) + 1;
+                p.capillaryOriginX = o.x;
+                p.capillaryOriginY = o.y;
+                p.capillaryAngle = o.targetAngle;
+                p.sourceIdx = o.sourceIdx;
+                p.age = 0;
+                p.capillaryWiggleSeed = Math.random() * Math.PI * 2;
+                p.capillaryWiggleFreq = CAP_WIGGLE_FREQ_BASE + Math.random() * CAP_WIGGLE_FREQ_VAR;
+                p.drawOpacity = CAPILLARY_MAX_OPACITY;
+                p._recycled = false;
+
+                // Channel-following: scan from origin for established capillary channels
+                let oc = Math.floor(o.x / GRID_SIZE);
+                let or_ = Math.floor(o.y / GRID_SIZE);
+                let dir = p.capillaryDir;
+                let bestPull = 0, bestDr = 0;
+                if (oc >= 0 && oc < cols && or_ >= 0 && or_ < rows) {
+                    for (let s = 1; s <= CAP_SCAN_RADIUS; s++) {
+                        let sc = oc + dir * s;
+                        if (sc < 0 || sc >= cols) break;
+                        for (let dr = -CAP_VERTICAL_SCAN; dr <= CAP_VERTICAL_SCAN; dr++) {
+                            let sr = or_ + dr;
+                            if (sr < 0 || sr >= rows) continue;
+                            let w = capWetnessGrid[sc + sr * cols] + capErosionGrid[sc + sr * cols] * EROSION_WEIGHT;
+                            if (w > bestPull) { bestPull = w; bestDr = dr; }
+                        }
+                    }
+                }
+                if (bestPull > CAP_CHANNEL_THRESHOLD) {
+                    let outX = Math.cos(o.targetAngle);
+                    let outY = Math.sin(o.targetAngle);
+                    p.vx = outX * CAPILLARY_LATERAL_FORCE * CAP_LATERAL_SCALE;
+                    p.vy = outY * CAPILLARY_LATERAL_FORCE * CAP_LATERAL_SCALE + bestDr * CAP_ATTRACT_SCALE;
+                } else {
+                    p.vx = 0;
+                    p.vy = 0;
+                }
+            }
+        }
+
         for (let i = 0; i < particles.length; i++) {
             particles[i].update();
         }
@@ -1506,7 +1603,7 @@ function animate() {
                 let cx = (ci.sumC / ci.count + 0.5) * RIVER_CELL_SIZE;
                 let cy = gridYStart + (ci.sumR / ci.count + 0.5) * RIVER_CELL_SIZE;
                 let clr = RIVER_COLORS[riverComponentColors[i] % RIVER_COLORS.length];
-                let label = `S${riverComponentColors[i] + 1}`;
+                let label = `S${riverComponentColors[i]}`;
                 overlayCtx.strokeStyle = 'white';
                 overlayCtx.lineWidth = 3;
                 overlayCtx.strokeText(label, cx - 8, cy);
@@ -1816,7 +1913,7 @@ function animate() {
             ``,
             `Total: ${total}  (Delta min: ${source})`,
             `River: ${river}`,
-            `Capillary: ${capillary}  Diversion: ${capillaryDiversion ? 'ON' : 'OFF'} (B)  Threshold: ${CAPILLARY_DIVERSION_THRESHOLD}`,
+            `Capillary: ${capillary}/${MAX_RECYCLED_CAPILLARIES}  Diversion: ${capillaryDiversion ? 'ON' : 'OFF'} (B)  Threshold: ${CAPILLARY_DIVERSION_THRESHOLD}`,
             `Origins: ${capillaryOrigins.length}`,
             ``,
             `CANVAS`,

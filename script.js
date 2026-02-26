@@ -12,11 +12,12 @@ let erosionOverlay = false; // Toggle with 'E' key
 let particleStatsOverlay = false; // Toggle with 'P' key
 let transparentParticles = false; // Toggle with 'T' key
 let sourceColorParticles = false; // Toggle with 'C' key
+let capillaryDiversion = true;     // Toggle with 'B' key — capillary branching on/off
+let deltaParticleCount = 0;        // updated each tick — particles in delta zone
+let riverZoneParticleCount = 0;    // updated each tick — non-source particles (incl. capillaries) in river zone
 let riverSampleMode = false;       // toggled by 'R' key
 let _prevOverlayActive = false;    // tracks overlay state for lazy clear
-let riverSampleRect = null;        // {x, y, w, h} in pixels — the selected rectangle
-let riverSampleDragging = false;   // true while mouse is held down to size the rect
-let riverSampleStart = null;       // {x, y} — mouse position at drag start
+let riverSampleSize = 100;         // half-size of the sample square (pixels)
 let riverSampleStats = null;       // computed stats object, displayed on overlay
 // ==========================================
 // CONFIGURATION & TUNING VARIABLES
@@ -27,7 +28,7 @@ let riverSampleStats = null;       // computed stats object, displayed on overla
 const NUM_PARTICLES = 30000;
 const BURST_COUNT = 200;
 // Fraction of particles dedicated to the delta zone (reset when they leave it)
-const SOURCE_PARTICLE_FRACTION = 0.25;
+const SOURCE_PARTICLE_COUNT = 4000;
 
 // --- Flow Field & Noise ---
 // How zoomed in the noise field is. Smaller = broader rivers
@@ -91,6 +92,8 @@ const FADE_FAST_AMOUNT = 6;
 // --- Capillary Ants ---
 const CAPILLARY_DIVERT_RADIUS = 20;
 const CAPILLARY_DIVERT_FRACTION = 0.15;
+const CAPILLARY_DIVERT_MIN_WETNESS = 8.0;
+const CAPILLARY_DIVERT_WETNESS_COMPENSATION = 3.0;
 const CAPILLARY_LATERAL_FORCE = 1.2;
 const CAPILLARY_GRAVITY = 0.4;
 const CAPILLARY_MAX_OPACITY = 0.8;
@@ -113,9 +116,157 @@ const TRANSITION_ZONE_END = 0.40;
 const RIVER_CELL_SIZE = 3;
 
 // --- River gap detection (particle-level repulsion) ---
+// --- Push Arc (curved pill shape) ---
+const PUSH_ARC_RADIUS = 300;   // curvature radius (larger = flatter)
+const PUSH_ARC_SPAN   = 1.0;   // angular span in radians (~57 deg)
+const PUSH_PILL_RADIUS = 10;   // thickness around the arc
+
 const RIVER_GAP_THRESHOLD = 2.0;    // wetness below this = dry gap
 const RIVER_GAP_MIN_WIDTH = 3;      // consecutive dry cells to count as a gap
 const RIVER_REPULSE_STRENGTH = 0.4;  // multiplier for cross-gap repulsion
+
+// --- Sources & Spawning ---
+const NUM_SOURCES = 6;
+const SOURCE_MARGIN_RATIO = 0.1;
+const DELTA_SPAWN_WIDTH = 120;
+const SOURCE_SPAWN_HEIGHT = 30;
+
+// --- Capillary Heights ---
+const CAP_HEIGHT_START_EVEN = 0.10;
+const CAP_HEIGHT_START_ODD  = 0.05;
+const CAP_HEIGHT_SPACING     = 0.20;
+const CAP_HEIGHT_SPACING_VAR = 0.10;
+
+// --- Stream Convergence ---
+const CONVERGENCE_RAMP_RATIO = 0.10;
+const STREAM_SCAN_RADIUS     = 40;
+const EROSION_WEIGHT         = 3;
+const PULL_MIN_THRESHOLD     = 0.01;
+const PULL_FORCE_SCALE       = 0.1;
+const PULL_FORCE_MAX         = 2.0;
+const STAGNATION_BOOST_RATE  = 0.05;
+
+// --- Lateral Spread ---
+const WETNESS_SPREAD_THRESHOLD = 15;
+const WETNESS_SPREAD_SCALE     = 0.005;
+const WETNESS_SPREAD_MAX       = 0.3;
+
+// --- Edge & Top Forces ---
+const TOP_PUSH_FORCE    = 2.0;
+const EDGE_MARGIN_RATIO = 0.05;
+
+// --- Velocity & Stagnation ---
+const FORCE_TO_VELOCITY    = 0.2;
+const UPWARD_VELOCITY_DAMP = 0.1;
+const STAGNATION_THRESHOLD = 0.3;
+const STAGNATION_MAX       = 60;
+const STAGNATION_DECAY     = 0.95;
+
+// --- Particle Aging & Opacity ---
+const STRAY_AGE_ACCEL       = 2;
+const STRAY_FADE_RATIO      = 0.3;
+const STRAY_OPACITY_FACTOR  = 0.15;
+const BASE_AGE_RATE         = 0.10;
+const TRANSITION_AGE_BASE   = 0.20;
+const TRANSITION_AGE_RAMP   = 3.8;
+const DELTA_FADE_RATIO      = 0.5;
+const DELTA_FADE_STRENGTH   = 0.7;
+const OOB_MARGIN            = 50;
+
+// --- Capillary Diversion ---
+const CAPILLARY_DIVERSION_THRESHOLD = 10000;
+
+// --- Capillary Physics ---
+const CAP_WIGGLE_FREQ_BASE   = 0.04;
+const CAP_WIGGLE_FREQ_VAR    = 0.06;
+const CAP_LATERAL_SCALE      = 0.4;
+const CAP_VERTICAL_SCAN      = 2;
+const CAP_CHANNEL_THRESHOLD  = 0.1;
+const CAP_FRICTION           = 0.94;
+const CAP_MAX_SPEED          = 3.0;
+const CAP_FADE_IN_FRAMES     = 20;
+
+// --- Capillary Origin Cleanup ---
+const CAP_ORIGIN_FADE_BAND     = 20;
+const CAP_ACCEL_WETNESS_DECAY  = 0.90;
+const CAP_ACCEL_EROSION_DECAY  = 0.95;
+const CAP_CLEANUP_THRESHOLD    = 0.01;
+
+// --- River Detection ---
+const MIN_RIVER_CELLS      = 100;
+const RIVER_GRID_THROTTLE  = 3;
+const RIVER_RUN_MERGE_GAP  = 3;
+const RIVER_RUN_MIN_WIDTH  = 3;
+const BRIGHTNESS_BUCKET_1  = 15;
+const BRIGHTNESS_BUCKET_2  = 50;
+const BRIGHTNESS_BUCKET_3  = 128;
+
+// --- Controls: Mouse Push ---
+const MOUSE_PUSH_SCALE      = 3;
+const MOUSE_PUSH_VELOCITY   = 0.9;
+const PUSH_ANGLE_LERP_FAST  = 0.5;
+const PUSH_ANGLE_LERP_SLOW  = 0.08;
+
+// --- Controls: Burst ---
+const BURST_MAX_MULTIPLIER = 4;
+
+// --- Controls: Sample Mode ---
+const SAMPLE_SCROLL_STEP = 10;
+const SAMPLE_SIZE_MIN    = 10;
+const SAMPLE_SIZE_MAX    = 500;
+
+// --- Rendering: Trail Effects ---
+const TRAIL_BLUR_RADIUS    = 0.8;
+const TRAIL_BLUR_ALPHA     = 0.5;
+const TRANSPARENT_OPACITY  = 0.1;
+
+// --- Rendering: Particle Sizing ---
+const CAP_THICKNESS_DIVISOR  = 6.0;
+const CAP_MIN_RADIUS         = 0.8;
+const PARTICLE_RADIUS_SCALE  = 1.5;
+const DELTA_MIN_RADIUS       = 1.5;
+
+// --- Rendering: Wetness Heatmap ---
+const HEATMAP_LOW_BREAK        = 0.33;
+const HEATMAP_HIGH_BREAK       = 0.66;
+const HEATMAP_CELL_MIN_WETNESS = 0.5;
+const HEATMAP_WETNESS_ALPHA    = 0.5;
+
+// --- Rendering: Erosion Heatmap ---
+const EROSION_MID_BREAK      = 0.5;
+const EROSION_BASE_R         = 128;
+const EROSION_RANGE_R        = 127;
+const EROSION_BASE_G_HIGH    = 165;
+const EROSION_RANGE_G_HIGH   = 90;
+const EROSION_BASE_B         = 200;
+const HEATMAP_CELL_MIN_EROSION = 0.005;
+const HEATMAP_EROSION_ALPHA  = 0.6;
+
+// --- Rendering: Capillary Heatmap ---
+const CAP_WETNESS_BASE_R   = 180;
+const CAP_WETNESS_RANGE_R  = 75;
+const CAP_WETNESS_RANGE_G  = 100;
+const CAP_EROSION_RANGE_G  = 80;
+const CAP_EROSION_RANGE_B  = 30;
+
+// --- UI Layout: Fonts ---
+const OVERLAY_FONT_SIZE    = 12;
+const OVERLAY_FONT_SIZE_LG = 14;
+const COMP_LABEL_FONT_SIZE = 11;
+
+// --- UI Layout: Dash Patterns ---
+const OVERLAY_DASH_PATTERN = [8, 6];
+const PUSH_ARC_DASH        = [4, 4];
+
+// --- UI Layout: Debug Overlay ---
+const CAP_ORIGIN_CIRCLE_RADIUS = 12;
+const HELP_BAR_HEIGHT          = 50;
+
+// --- UI Layout: Stats Panels ---
+const STATS_LINE_HEIGHT       = 16;
+const SAMPLE_STATS_PANEL_W    = 380;
+const PARTICLE_STATS_PANEL_W  = 420;
+const STATS_PANEL_PADDING     = 16;
 
 // ==========================================
 
@@ -123,7 +274,7 @@ let lastFrameTime = performance.now();
 let smoothFPS = 60;
 let simSpeed = 1;
 
-let mouse = { x: 0, y: 0, prevX: 0, prevY: 0, frameDX: 0, frameDY: 0, speed: 0, active: false, middleDown: false, lastTime: 0 };
+let mouse = { x: 0, y: 0, prevX: 0, prevY: 0, frameDX: 0, frameDY: 0, speed: 0, active: false, leftDown: false, lastTime: 0, pushAngle: 0 };
 let burst = { charging: false, x: 0, y: 0, startTime: 0 };
 const BURST_MIN_RADIUS = 50;
 const BURST_MAX_RADIUS = 300;
@@ -140,6 +291,7 @@ let capOwnerStr;
 let capFadeMask;
 let riverGrid = null;           // Uint8Array, flat [row * riverGridCols + col] → 1 if bright
 let riverLabels = null;         // Int32Array, flat → component ID (0 = inactive)
+let riverCellLastSeen = null;   // Float64Array, timestamp (ms) when cell last met thresholds
 let riverGridCols = 0;
 let riverGridRows = 0;
 let numRiverComponents = 0;
@@ -188,11 +340,11 @@ function resize() {
     riverGridRows = Math.ceil((height - rzYStart) / RIVER_CELL_SIZE);
     riverGrid = new Uint8Array(riverGridCols * riverGridRows);
     riverLabels = new Int32Array(riverGridCols * riverGridRows);
+    riverCellLastSeen = new Float64Array(riverGridCols * riverGridRows);
 
     // Generate fixed source points across the top edge (only on first load)
     if (sourcePoints.length === 0) {
-        const NUM_SOURCES = 6;
-        const margin = width * 0.1;
+        const margin = width * SOURCE_MARGIN_RATIO;
         const spacing = (width - 2 * margin) / (NUM_SOURCES - 1);
         for (let i = 0; i < NUM_SOURCES; i++) {
             sourcePoints.push(margin + i * spacing);
@@ -202,11 +354,11 @@ function resize() {
     // Generate fixed capillary origin heights for each source
     capillaryHeights = [];
     for (let s = 0; s < sourcePoints.length; s++) {
-        let startY = height * (TRANSITION_ZONE_END + (s % 2 === 0 ? 0.10 : 0.05));
+        let startY = height * (TRANSITION_ZONE_END + (s % 2 === 0 ? CAP_HEIGHT_START_EVEN : CAP_HEIGHT_START_ODD));
         let y = startY;
         while (y < height) {
             capillaryHeights.push({ y: y, sourceIdx: s });
-            y += height * (0.20 + Math.random() * 0.10);
+            y += height * (CAP_HEIGHT_SPACING + Math.random() * CAP_HEIGHT_SPACING_VAR);
         }
     }
 
@@ -227,7 +379,9 @@ const RIVER_COLORS = [
     [200,255,232],  // Light Mint (original 235,255,248)
 ];
 const RIVER_BRIGHTNESS_THRESHOLD = 64; // min pixel brightness (0-255) for debug analysis
-const RIVER_WETNESS_THRESHOLD = 5.0; // min wetness value to count as river
+const RIVER_WETNESS_THRESHOLD = 8.0; // min wetness value to count as river
+const RIVER_PARTICLE_THRESHOLD = 1; // min particles in a river cell to count as river
+const RIVER_CELL_TIMEOUT = 5000;    // ms a river cell stays alive after thresholds drop
 
 class Particle {
     constructor() {
@@ -241,8 +395,8 @@ class Particle {
         const srcI = Math.floor(Math.random() * sourcePoints.length);
         const src = sourcePoints[srcI];
         this.sourceIdx = srcI;
-        this.x = src + (Math.random() - 0.5) * 120;
-        this.y = -Math.random() * 30;
+        this.x = src + (Math.random() - 0.5) * DELTA_SPAWN_WIDTH;
+        this.y = -Math.random() * SOURCE_SPAWN_HEIGHT;
         // Reset age for source particles so they stay fresh
         if (this.isSource) this.age = 0;
         this.vx = 0;
@@ -295,20 +449,19 @@ class Particle {
             // Scan laterally for nearby wet channels and pull toward the strongest one.
             // Larger channels (higher wetness+erosion) pull from further away,
             // causing small parallel streams to merge into dominant rivers.
-            let convergeFactor = Math.min(this.y / (height * 0.10), 1.0);
+            let convergeFactor = Math.min(this.y / (height * CONVERGENCE_RAMP_RATIO), 1.0);
             if (convergeFactor < 0) convergeFactor = 0;
 
             if (convergeFactor > 0) {
-                const SCAN_RADIUS = 40;
                 let attractLeft = 0, attractRight = 0;
                 let repulseLeft = 0, repulseRight = 0;
                 let inPostTransition = this.y >= height * TRANSITION_ZONE_END;
 
                 // Scan left
                 let gapCount = 0, crossedGap = false;
-                for (let s = 1; s <= SCAN_RADIUS; s++) {
+                for (let s = 1; s <= STREAM_SCAN_RADIUS; s++) {
                     if (c - s < 0) break;
-                    let w = wetnessGrid[idx - s] + erosionGrid[idx - s] * 3;
+                    let w = wetnessGrid[idx - s] + erosionGrid[idx - s] * EROSION_WEIGHT;
                     let distFalloff = 1.0 / (s * s);
                     if (inPostTransition) {
                         if (w < RIVER_GAP_THRESHOLD) {
@@ -329,9 +482,9 @@ class Particle {
 
                 // Scan right
                 gapCount = 0; crossedGap = false;
-                for (let s = 1; s <= SCAN_RADIUS; s++) {
+                for (let s = 1; s <= STREAM_SCAN_RADIUS; s++) {
                     if (c + s >= cols) break;
-                    let w = wetnessGrid[idx + s] + erosionGrid[idx + s] * 3;
+                    let w = wetnessGrid[idx + s] + erosionGrid[idx + s] * EROSION_WEIGHT;
                     let distFalloff = 1.0 / (s * s);
                     if (inPostTransition) {
                         if (w < RIVER_GAP_THRESHOLD) {
@@ -356,10 +509,10 @@ class Particle {
                 let netX = pullX + repulseX;
 
                 let pullAbs = Math.abs(netX);
-                if (pullAbs > 0.01) {
+                if (pullAbs > PULL_MIN_THRESHOLD) {
                     let sign = netX > 0 ? 1 : -1;
-                    let attractStrength = Math.min(pullAbs * 0.1, 2.0) * convergeFactor;
-                    let stagnationBoost = 1.0 + this.stagnation * 0.05;
+                    let attractStrength = Math.min(pullAbs * PULL_FORCE_SCALE, PULL_FORCE_MAX) * convergeFactor;
+                    let stagnationBoost = 1.0 + this.stagnation * STAGNATION_BOOST_RATE;
                     attractStrength *= stagnationBoost;
                     forceX += sign * attractStrength;
                 }
@@ -371,8 +524,8 @@ class Particle {
             forceX += (Math.random() - 0.5) * erosionSpread;
 
             // Base lateral spread at high wetness (immediate width from water volume)
-            if (cellWetness > 15) {
-                forceX += (Math.random() - 0.5) * Math.min(cellWetness * 0.005, 0.3);
+            if (cellWetness > WETNESS_SPREAD_THRESHOLD) {
+                forceX += (Math.random() - 0.5) * Math.min(cellWetness * WETNESS_SPREAD_SCALE, WETNESS_SPREAD_MAX);
             }
         }
 
@@ -382,19 +535,19 @@ class Particle {
         forceY += this.gravity + this.stagnation * 0.02;
 
         // Extra downward push near the top so particles don't stagnate in the delta zone
-        if (this.y < height * 0.10) {
-            let topFactor = 1.0 - (this.y / (height * 0.10));
-            forceY += topFactor * 2.0;
+        if (this.y < height * CONVERGENCE_RAMP_RATIO) {
+            let topFactor = 1.0 - (this.y / (height * CONVERGENCE_RAMP_RATIO));
+            forceY += topFactor * TOP_PUSH_FORCE;
         }
 
         // Push particles away from left/right edges
-        let edgeMargin = width * 0.05;
+        let edgeMargin = width * EDGE_MARGIN_RATIO;
         if (this.x < edgeMargin) {
             let edgeFactor = 1.0 - (this.x / edgeMargin);
-            forceX += edgeFactor * 2.0;
+            forceX += edgeFactor * TOP_PUSH_FORCE;
         } else if (this.x > width - edgeMargin) {
             let edgeFactor = 1.0 - ((width - this.x) / edgeMargin);
-            forceX += -edgeFactor * 2.0;
+            forceX += -edgeFactor * TOP_PUSH_FORCE;
         }
 
         // Normalize total force
@@ -402,40 +555,37 @@ class Particle {
         forceX /= length;
         forceY /= length;
 
-        this.vx += forceX * 0.2 * this.speed;
-        this.vy += forceY * 0.2 * this.speed;
+        this.vx += forceX * FORCE_TO_VELOCITY * this.speed;
+        this.vy += forceY * FORCE_TO_VELOCITY * this.speed;
 
         // Friction to limit max speed
         this.vx *= FRICTION;
         this.vy *= FRICTION;
 
         // Prevent particles from moving upward — water flows downhill
-        if (this.vy < 0) this.vy *= 0.1;
+        if (this.vy < 0) this.vy *= UPWARD_VELOCITY_DAMP;
 
         // Track stagnation: particles barely moving accumulate stagnation,
         // which boosts their attraction toward nearby streams
         let speed = Math.sqrt(this.vx * this.vx + this.vy * this.vy);
-        if (speed < 0.3) {
-            this.stagnation = Math.min(this.stagnation + 1, 60);
+        if (speed < STAGNATION_THRESHOLD) {
+            this.stagnation = Math.min(this.stagnation + 1, STAGNATION_MAX);
         } else {
-            this.stagnation *= 0.95;
+            this.stagnation *= STAGNATION_DECAY;
         }
 
         this.x += this.vx;
         this.y += this.vy;
 
-        // Mouse circle displacement — physically push particles
-        if (mouse.active && mouse.middleDown && (mouse.frameDX !== 0 || mouse.frameDY !== 0)) {
-            let pushRadius = 50;
-            let mdx = this.x - mouse.x;
-            let mdy = this.y - mouse.y;
-            let dist = Math.sqrt(mdx * mdx + mdy * mdy);
-            if (dist < pushRadius) {
-                let falloff = 1.0 - dist / pushRadius;
-                this.x += mouse.frameDX * falloff;
-                this.y += mouse.frameDY * falloff;
-                this.vx += mouse.frameDX * falloff * 0.3;
-                this.vy += mouse.frameDY * falloff * 0.3;
+        // Mouse arc pill displacement — physically push particles
+        if (mouse.active && mouse.leftDown && (mouse.frameDX !== 0 || mouse.frameDY !== 0)) {
+            let dist = pushArcDist(this.x, this.y);
+            if (dist < PUSH_PILL_RADIUS) {
+                let falloff = 1.0 - dist / PUSH_PILL_RADIUS;
+                this.x += mouse.frameDX * falloff * MOUSE_PUSH_SCALE;
+                this.y += mouse.frameDY * falloff * MOUSE_PUSH_SCALE;
+                this.vx += mouse.frameDX * falloff * MOUSE_PUSH_VELOCITY;
+                this.vy += mouse.frameDY * falloff * MOUSE_PUSH_VELOCITY;
             }
         }
 
@@ -447,12 +597,19 @@ class Particle {
 
         // Capillary diversion: non-source river particles near a capillary origin
         // may fork off into capillary mode
-        if (!this.isSource) {
+        if (!this.isSource && capillaryDiversion && riverZoneParticleCount > CAPILLARY_DIVERSION_THRESHOLD) {
             for (let o of capillaryOrigins) {
                 let cdx = this.x - o.x;
                 let cdy = this.y - o.y;
                 let dist2 = cdx * cdx + cdy * cdy;
                 if (dist2 < CAPILLARY_DIVERT_RADIUS * CAPILLARY_DIVERT_RADIUS) {
+                    // Only divert if local river wetness is strong enough to sustain the loss
+                    let oc = Math.floor(o.x / GRID_SIZE);
+                    let or_ = Math.floor(o.y / GRID_SIZE);
+                    let localWetness = (oc >= 0 && oc < cols && or_ >= 0 && or_ < rows)
+                        ? wetnessGrid[oc + or_ * cols] : 0;
+                    if (localWetness < CAPILLARY_DIVERT_MIN_WETNESS) break;
+
                     if (Math.random() < CAPILLARY_DIVERT_FRACTION) {
                         this.isCapillary = true;
                         this.capillaryDir = o.leftOk && !o.rightOk ? -1 : (!o.leftOk && o.rightOk ? 1 : (Math.random() < 0.5 ? -1 : 1));
@@ -461,8 +618,12 @@ class Particle {
                         this.sourceIdx = o.sourceIdx;
                         this.age = 0;
                         this.capillaryWiggleSeed = Math.random() * Math.PI * 2;
-                        this.capillaryWiggleFreq = 0.04 + Math.random() * 0.06;
+                        this.capillaryWiggleFreq = CAP_WIGGLE_FREQ_BASE + Math.random() * CAP_WIGGLE_FREQ_VAR;
                         this.drawOpacity = CAPILLARY_MAX_OPACITY;
+                        // Compensate river wetness for the diverted particle
+                        if (oc >= 0 && oc < cols && or_ >= 0 && or_ < rows) {
+                            wetnessGrid[oc + or_ * cols] += CAPILLARY_DIVERT_WETNESS_COMPENSATION;
+                        }
                         return;
                     }
                     break;
@@ -481,29 +642,29 @@ class Particle {
         let inStream = cellWetness >= WETNESS_DRY_THRESHOLD;
 
         if (!inStream && !inDelta && !inTransition && !this.isSource) {
-            this.age += 2; // Small stray strands dry up / get absorbed rapidly
+            this.age += STRAY_AGE_ACCEL; // Small stray strands dry up / get absorbed rapidly
             // Fade out based on age — stray particles become invisible over time
-            let ageFade = 1.0 - Math.min(this.age / (this.life * 0.3), 1.0);
-            this.drawOpacity = MAX_DRAW_OPACITY * 0.15 * ageFade;
+            let ageFade = 1.0 - Math.min(this.age / (this.life * STRAY_FADE_RATIO), 1.0);
+            this.drawOpacity = MAX_DRAW_OPACITY * STRAY_OPACITY_FACTOR * ageFade;
         } else {
             // Blend aging rate: delta (0.20) -> river (0.20) for in-stream,
             // but transition zone strays age faster as they leave the delta
-            let ageRate = 0.10;
+            let ageRate = BASE_AGE_RATE;
             if (inTransition && !inStream) {
-                ageRate = 0.20 + transitionT * 3.8; // blends toward 4.0
+                ageRate = TRANSITION_AGE_BASE + transitionT * TRANSITION_AGE_RAMP; // blends toward 4.0
             }
             this.age += ageRate;
 
             let baseOpacity = Math.min(MAX_DRAW_OPACITY, cellWetness / 100);
             if (inDelta) {
                 // Delta particles fade as they age without finding a stream
-                let deltaAge = Math.min(this.age / (this.life * 0.5), 1.0);
-                let deltaFade = 1.0 - deltaAge * 0.7;
+                let deltaAge = Math.min(this.age / (this.life * DELTA_FADE_RATIO), 1.0);
+                let deltaFade = 1.0 - deltaAge * DELTA_FADE_STRENGTH;
                 baseOpacity = Math.max(baseOpacity, MAX_DRAW_OPACITY * deltaFade);
             } else if (inTransition && !inStream) {
                 // Transition zone: blend delta opacity boost toward zero
-                let deltaAge = Math.min(this.age / (this.life * 0.5), 1.0);
-                let deltaFade = 1.0 - deltaAge * 0.7;
+                let deltaAge = Math.min(this.age / (this.life * DELTA_FADE_RATIO), 1.0);
+                let deltaFade = 1.0 - deltaAge * DELTA_FADE_STRENGTH;
                 let deltaOpacity = MAX_DRAW_OPACITY * deltaFade;
                 baseOpacity = Math.max(baseOpacity, deltaOpacity * (1.0 - transitionT));
             }
@@ -512,7 +673,7 @@ class Particle {
         this.inDelta = inDelta || inTransition;
 
         // Reset if out of bounds or too old
-        if (this.x < -50 || this.x > width + 50 || this.y > height + 50 || this.age > this.life) {
+        if (this.x < -OOB_MARGIN || this.x > width + OOB_MARGIN || this.y > height + OOB_MARGIN || this.age > this.life) {
             this.reset();
         }
     }
@@ -539,7 +700,7 @@ class Particle {
         }
 
         // Strong lateral force
-        this.vx += this.capillaryDir * CAPILLARY_LATERAL_FORCE * 0.4;
+        this.vx += this.capillaryDir * CAPILLARY_LATERAL_FORCE * CAP_LATERAL_SCALE;
 
         // Gentle gravity
         this.vy += CAPILLARY_GRAVITY;
@@ -576,12 +737,12 @@ class Particle {
             for (let s = 1; s <= CAP_SCAN_RADIUS; s++) {
                 let sc = c + dir * s;
                 if (sc < 0 || sc >= cols) break;
-                for (let dr = -2; dr <= 2; dr++) {
+                for (let dr = -CAP_VERTICAL_SCAN; dr <= CAP_VERTICAL_SCAN; dr++) {
                     let sr = r + dr;
                     if (sr < 0 || sr >= rows) continue;
                     let scanIdx = sc + sr * cols;
-                    let w = capWetnessGrid[scanIdx] + capErosionGrid[scanIdx] * 3;
-                    if (w > 0.1) {
+                    let w = capWetnessGrid[scanIdx] + capErosionGrid[scanIdx] * EROSION_WEIGHT;
+                    if (w > CAP_CHANNEL_THRESHOLD) {
                         let owner = capOwnerGrid[scanIdx];
                         if (owner === 0 || owner === this.streamId) {
                             pullY += dr * w * CAP_ATTRACT_SCALE / (s * s);
@@ -597,31 +758,29 @@ class Particle {
         }
 
         // Friction and velocity clamping
-        this.vx *= 0.94;
-        this.vy *= 0.94;
+        this.vx *= CAP_FRICTION;
+        this.vy *= CAP_FRICTION;
         let spd = Math.sqrt(this.vx * this.vx + this.vy * this.vy);
-        if (spd > 3.0) {
-            this.vx = (this.vx / spd) * 3.0;
-            this.vy = (this.vy / spd) * 3.0;
+        if (spd > CAP_MAX_SPEED) {
+            this.vx = (this.vx / spd) * CAP_MAX_SPEED;
+            this.vy = (this.vy / spd) * CAP_MAX_SPEED;
         }
 
         this.x += this.vx;
         this.y += this.vy;
 
-        // Mouse pill displacement
-        if (mouse.active && mouse.middleDown && (mouse.frameDX !== 0 || mouse.frameDY !== 0)) {
-            let mdx = this.x - mouse.x;
-            let mdy = this.y - mouse.y;
-            let dist = Math.sqrt(mdx * mdx + mdy * mdy);
-            if (dist < 20) {
-                let falloff = 1.0 - dist / 20;
-                this.x += mouse.frameDX * falloff;
-                this.y += mouse.frameDY * falloff;
+        // Mouse arc pill displacement
+        if (mouse.active && mouse.leftDown && (mouse.frameDX !== 0 || mouse.frameDY !== 0)) {
+            let dist = pushArcDist(this.x, this.y);
+            if (dist < PUSH_PILL_RADIUS) {
+                let falloff = 1.0 - dist / PUSH_PILL_RADIUS;
+                this.x += mouse.frameDX * falloff * MOUSE_PUSH_SCALE;
+                this.y += mouse.frameDY * falloff * MOUSE_PUSH_SCALE;
             }
         }
 
-        // Opacity: fade in over first 20 frames
-        let fadeIn = Math.min(this.age / 20, 1.0);
+        // Opacity: fade in over first CAP_FADE_IN_FRAMES frames
+        let fadeIn = Math.min(this.age / CAP_FADE_IN_FRAMES, 1.0);
         this.drawOpacity = CAPILLARY_MAX_OPACITY * fadeIn;
 
         // River absorption: revert to river particle on contact
@@ -639,14 +798,14 @@ class Particle {
         }
 
         // OOB check — revert to river
-        if (this.x < -50 || this.x > width + 50 || this.y < -50 || this.y > height + 50) {
+        if (this.x < -OOB_MARGIN || this.x > width + OOB_MARGIN || this.y < -OOB_MARGIN || this.y > height + OOB_MARGIN) {
             this._revertToRiver();
         }
     }
 
 }
 
-const SOURCE_COUNT = Math.floor(NUM_PARTICLES * SOURCE_PARTICLE_FRACTION);
+const SOURCE_COUNT = SOURCE_PARTICLE_COUNT;
 for (let i = 0; i < NUM_PARTICLES; i++) {
     let p = new Particle();
     p.isCapillary = false;
@@ -692,9 +851,9 @@ function computeRiverSampleStats(rect) {
     for (let i = 0; i < pixelCount; i++) {
         let b = brightVals[i];
         if (b === 0) buckets[0]++;
-        else if (b <= 15) buckets[1]++;
-        else if (b <= 50) buckets[2]++;
-        else if (b <= 128) buckets[3]++;
+        else if (b <= BRIGHTNESS_BUCKET_1) buckets[1]++;
+        else if (b <= BRIGHTNESS_BUCKET_2) buckets[2]++;
+        else if (b <= BRIGHTNESS_BUCKET_3) buckets[3]++;
         else buckets[4]++;
         if (b >= RIVER_BRIGHTNESS_THRESHOLD) aboveThreshold++;
     }
@@ -735,13 +894,13 @@ function computeRiverSampleStats(rect) {
     // Merge runs with < 3 cell gap
     let mergedRuns = [];
     for (let r of detectedRuns) {
-        if (mergedRuns.length > 0 && r.left - mergedRuns[mergedRuns.length - 1].right < 3) {
+        if (mergedRuns.length > 0 && r.left - mergedRuns[mergedRuns.length - 1].right < RIVER_RUN_MERGE_GAP) {
             mergedRuns[mergedRuns.length - 1].right = r.right;
         } else {
             mergedRuns.push({ ...r });
         }
     }
-    mergedRuns = mergedRuns.filter(r => (r.right - r.left + 1) >= 3);
+    mergedRuns = mergedRuns.filter(r => (r.right - r.left + 1) >= RIVER_RUN_MIN_WIDTH);
     let passingCols = 0;
     for (let c = 0; c < colCount; c++) if (colAvgs[c] >= RIVER_BRIGHTNESS_THRESHOLD) passingCols++;
 
@@ -764,13 +923,26 @@ function computeRiverSampleStats(rect) {
 let riverGridFrame = 0;
 function updateRiverGrid() {
     riverGridFrame++;
-    if (riverGridFrame % 3 !== 0) return; // throttle to every 3rd frame
+    if (riverGridFrame % RIVER_GRID_THROTTLE !== 0) return; // throttle
 
     let rzYStart = Math.floor(height * TRANSITION_ZONE_END);
     let zoneH = height - rzYStart;
     if (zoneH <= 0 || riverGridCols === 0 || riverGridRows === 0) return;
 
-    // Downsample wetness grid directly instead of reading back pixels
+    // Count particles per river cell
+    let cellCounts = new Uint16Array(riverGridCols * riverGridRows);
+    for (let i = 0; i < particles.length; i++) {
+        let p = particles[i];
+        if (p.isCapillary || p.y < rzYStart) continue;
+        let r = Math.floor((p.y - rzYStart) / RIVER_CELL_SIZE);
+        let c = Math.floor(p.x / RIVER_CELL_SIZE);
+        if (r >= 0 && r < riverGridRows && c >= 0 && c < riverGridCols) {
+            cellCounts[r * riverGridCols + c]++;
+        }
+    }
+
+    // Downsample wetness grid + particle count to classify river cells
+    let now = performance.now();
     riverGrid.fill(0);
     for (let r = 0; r < riverGridRows; r++) {
         let pyStart = rzYStart + r * RIVER_CELL_SIZE;
@@ -778,6 +950,7 @@ function updateRiverGrid() {
         let wRowStart = Math.floor(pyStart / GRID_SIZE);
         let wRowEnd = Math.min(Math.ceil(pyEnd / GRID_SIZE), rows);
         for (let c = 0; c < riverGridCols; c++) {
+            let idx = r * riverGridCols + c;
             let pxStart = c * RIVER_CELL_SIZE;
             let pxEnd = Math.min(pxStart + RIVER_CELL_SIZE, width);
             let wColStart = Math.floor(pxStart / GRID_SIZE);
@@ -789,8 +962,11 @@ function updateRiverGrid() {
                     if (w > maxW) maxW = w;
                 }
             }
-            if (maxW >= RIVER_WETNESS_THRESHOLD) {
-                riverGrid[r * riverGridCols + c] = 1;
+            if (maxW >= RIVER_WETNESS_THRESHOLD && cellCounts[idx] >= RIVER_PARTICLE_THRESHOLD) {
+                riverCellLastSeen[idx] = now;
+                riverGrid[idx] = 1;
+            } else if (now - riverCellLastSeen[idx] < RIVER_CELL_TIMEOUT) {
+                riverGrid[idx] = 1;
             }
         }
     }
@@ -862,8 +1038,7 @@ function updateRiverGrid() {
         }
     }
 
-    // Filter out small components (fewer than 20 cells)
-    const MIN_RIVER_CELLS = 100;
+    // Filter out small components
     for (let i = 0; i < label; i++) {
         if (comps[i].count < MIN_RIVER_CELLS) {
             let lbl = i + 1;
@@ -968,8 +1143,8 @@ function updateRiverGrid() {
             // This origin disappeared — mark its grid band for accelerated fade
             let originY = key % 100000;
             let rCenter = Math.floor(originY / GRID_SIZE);
-            let rMin = Math.max(0, rCenter - 20);
-            let rMax = Math.min(rows - 1, rCenter + 20);
+            let rMin = Math.max(0, rCenter - CAP_ORIGIN_FADE_BAND);
+            let rMax = Math.min(rows - 1, rCenter + CAP_ORIGIN_FADE_BAND);
             for (let gr = rMin; gr <= rMax; gr++) {
                 let rowOff = gr * cols;
                 for (let gc = 0; gc < cols; gc++) {
@@ -982,11 +1157,50 @@ function updateRiverGrid() {
     prevCapillaryOriginKeys = currentKeys;
 }
 
+// Distance from point (px,py) to the push arc pill shape.
+// Returns distance to nearest point on the arc's spine, or Infinity if outside.
+function pushArcDist(px, py) {
+    let angle = mouse.pushAngle;
+    // Arc center is behind cursor (opposite of motion) so concave side faces forward
+    let dirX = Math.cos(angle);
+    let dirY = Math.sin(angle);
+    let acx = mouse.x - dirX * PUSH_ARC_RADIUS;
+    let acy = mouse.y - dirY * PUSH_ARC_RADIUS;
+    // Angle from arc center to test point
+    let dx = px - acx;
+    let dy = py - acy;
+    let ptAngle = Math.atan2(dy, dx);
+    // Arc midpoint angle points toward cursor (forward/motion direction)
+    let midAngle = Math.atan2(dirY, dirX);
+    let half = PUSH_ARC_SPAN * 0.5;
+    // Clamp ptAngle to arc range
+    let diff = ptAngle - midAngle;
+    diff = Math.atan2(Math.sin(diff), Math.cos(diff)); // normalize to [-PI, PI]
+    if (diff < -half) diff = -half;
+    if (diff >  half) diff =  half;
+    let clampedAngle = midAngle + diff;
+    // Nearest point on arc spine
+    let nearX = acx + PUSH_ARC_RADIUS * Math.cos(clampedAngle);
+    let nearY = acy + PUSH_ARC_RADIUS * Math.sin(clampedAngle);
+    let ndx = px - nearX;
+    let ndy = py - nearY;
+    return Math.sqrt(ndx * ndx + ndy * ndy);
+}
+
 function animate() {
     let now = performance.now();
     let dt = now - lastFrameTime;
     lastFrameTime = now;
     if (dt > 0) smoothFPS = smoothFPS * 0.95 + (1000 / dt) * 0.05;
+
+    // Update push angle from mouse motion
+    if (mouse.active && (mouse.frameDX !== 0 || mouse.frameDY !== 0)) {
+        let target = Math.atan2(mouse.frameDY, mouse.frameDX);
+        let diff = target - mouse.pushAngle;
+        diff = Math.atan2(Math.sin(diff), Math.cos(diff));
+        let lerp = Math.abs(diff) > Math.PI * 0.5 ? PUSH_ANGLE_LERP_FAST : PUSH_ANGLE_LERP_SLOW;
+        mouse.pushAngle += diff * lerp;
+    }
 
     for (let tick = 0; tick < simSpeed; tick++) {
         // Evaporate wetness grid and slowly decay erosion
@@ -995,10 +1209,10 @@ function animate() {
             erosionGrid[k] *= EROSION_DECAY;
             if (capFadeMask[k]) {
                 // Accelerated decay for disappeared origins
-                capWetnessGrid[k] *= 0.90;
-                capErosionGrid[k] *= 0.95;
-                capOwnerStr[k] *= 0.90;
-                if (capWetnessGrid[k] < 0.01 && capErosionGrid[k] < 0.01) {
+                capWetnessGrid[k] *= CAP_ACCEL_WETNESS_DECAY;
+                capErosionGrid[k] *= CAP_ACCEL_EROSION_DECAY;
+                capOwnerStr[k] *= CAP_ACCEL_WETNESS_DECAY;
+                if (capWetnessGrid[k] < CAP_CLEANUP_THRESHOLD && capErosionGrid[k] < CAP_CLEANUP_THRESHOLD) {
                     capFadeMask[k] = 0;
                     capOwnerGrid[k] = 0;
                     capOwnerStr[k] = 0;
@@ -1008,7 +1222,17 @@ function animate() {
                 capErosionGrid[k] *= CAP_EROSION_DECAY;
                 capOwnerStr[k] *= CAP_EVAPORATION_RATE;
             }
-            if (capOwnerStr[k] < 0.01) { capOwnerGrid[k] = 0; capOwnerStr[k] = 0; }
+            if (capOwnerStr[k] < CAP_CLEANUP_THRESHOLD) { capOwnerGrid[k] = 0; capOwnerStr[k] = 0; }
+        }
+
+        // Count particles by zone
+        let deltaEnd = height * DELTA_ZONE_END;
+        deltaParticleCount = 0;
+        riverZoneParticleCount = 0;
+        for (let i = 0; i < particles.length; i++) {
+            let p = particles[i];
+            if (p.y >= 0 && p.y < deltaEnd) deltaParticleCount++;
+            if (!p.isSource && p.y >= height * TRANSITION_ZONE_END) riverZoneParticleCount++;
         }
 
         // Grid-based river detection (transition zone to bottom)
@@ -1045,8 +1269,8 @@ function animate() {
 
         // Subtle blur pass to soften accumulated trail edges
         ctx.save();
-        ctx.filter = 'blur(0.8px)';
-        ctx.globalAlpha = 0.5;
+        ctx.filter = `blur(${TRAIL_BLUR_RADIUS}px)`;
+        ctx.globalAlpha = TRAIL_BLUR_ALPHA;
         ctx.drawImage(canvas, 0, 0);
         ctx.restore();
     }
@@ -1057,15 +1281,15 @@ function animate() {
         const p = particles[i];
         if (p.drawOpacity <= MIN_DRAW_OPACITY) continue;
 
-        let opacity = transparentParticles ? p.drawOpacity * 0.1 : p.drawOpacity;
+        let opacity = transparentParticles ? p.drawOpacity * TRANSPARENT_OPACITY : p.drawOpacity;
         let radius;
 
         if (p.isCapillary) {
             let c = Math.floor(p.x / GRID_SIZE);
             let r = Math.floor(p.y / GRID_SIZE);
             let capW = (c >= 0 && c < cols && r >= 0 && r < rows) ? capWetnessGrid[c + r * cols] : 0;
-            let thickness = Math.min(capW / 6.0, 1.0);
-            radius = 0.8 + thickness * (CAPILLARY_MAX_RADIUS - 0.8);
+            let thickness = Math.min(capW / CAP_THICKNESS_DIVISOR, 1.0);
+            radius = CAP_MIN_RADIUS + thickness * (CAPILLARY_MAX_RADIUS - CAP_MIN_RADIUS);
 
             if (debugOverlay) {
                 let clr = RIVER_COLORS[p.sourceIdx % RIVER_COLORS.length];
@@ -1080,8 +1304,8 @@ function animate() {
                 ctx.globalAlpha = opacity;
             }
         } else {
-            radius = p.weight * 1.5 * Math.sin((p.age / p.life) * Math.PI);
-            if (p.inDelta) radius = Math.max(radius, 1.5);
+            radius = p.weight * PARTICLE_RADIUS_SCALE * Math.sin((p.age / p.life) * Math.PI);
+            if (p.inDelta) radius = Math.max(radius, DELTA_MIN_RADIUS);
 
             if (sourceColorParticles) {
                 let clr = RIVER_COLORS[p.sourceIdx % RIVER_COLORS.length];
@@ -1097,6 +1321,45 @@ function animate() {
         ctx.fillRect(p.x - radius, p.y - radius, d, d);
     }
     ctx.globalAlpha = 1.0;
+
+    // Shift wetness/erosion grids with the push arc pill
+    if (mouse.active && mouse.leftDown && (mouse.frameDX !== 0 || mouse.frameDY !== 0)) {
+        let scanR = PUSH_ARC_RADIUS + PUSH_ARC_SPAN * PUSH_ARC_RADIUS * 0.5 + PUSH_PILL_RADIUS;
+        let gridR = Math.ceil(scanR / GRID_SIZE);
+        let mcx = Math.floor(mouse.x / GRID_SIZE);
+        let mcy = Math.floor(mouse.y / GRID_SIZE);
+        let shiftCols = mouse.frameDX * MOUSE_PUSH_SCALE / GRID_SIZE;
+        let shiftRows = mouse.frameDY * MOUSE_PUSH_SCALE / GRID_SIZE;
+        // Collect cells in the push arc pill with their shifted values
+        let moved = [];
+        for (let dy = -gridR; dy <= gridR; dy++) {
+            for (let dx = -gridR; dx <= gridR; dx++) {
+                let sc = mcx + dx;
+                let sr = mcy + dy;
+                if (sc < 0 || sc >= cols || sr < 0 || sr >= rows) continue;
+                let cellX = (sc + 0.5) * GRID_SIZE;
+                let cellY = (sr + 0.5) * GRID_SIZE;
+                let dist = pushArcDist(cellX, cellY);
+                if (dist >= PUSH_PILL_RADIUS) continue;
+                let falloff = 1.0 - dist / PUSH_PILL_RADIUS;
+                let srcC = Math.round(sc - shiftCols * falloff);
+                let srcR = Math.round(sr - shiftRows * falloff);
+                if (srcC < 0 || srcC >= cols || srcR < 0 || srcR >= rows) {
+                    moved.push({ c: sc, r: sr, w: 0, e: 0, cw: 0, ce: 0 });
+                } else {
+                    let si = srcC + srcR * cols;
+                    moved.push({ c: sc, r: sr, w: wetnessGrid[si], e: erosionGrid[si], cw: capWetnessGrid[si], ce: capErosionGrid[si] });
+                }
+            }
+        }
+        for (let m of moved) {
+            let idx = m.c + m.r * cols;
+            wetnessGrid[idx] = m.w;
+            erosionGrid[idx] = m.e;
+            capWetnessGrid[idx] = m.cw;
+            capErosionGrid[idx] = m.ce;
+        }
+    }
 
     // Reset per-frame mouse displacement accumulators (after particles have read them)
     mouse.frameDX = 0;
@@ -1127,14 +1390,14 @@ function animate() {
     _prevOverlayActive = overlayActive;
     if (debugOverlay) {
         overlayCtx.save();
-        overlayCtx.setLineDash([8, 6]);
+        overlayCtx.setLineDash(OVERLAY_DASH_PATTERN);
         overlayCtx.lineWidth = 1;
-        overlayCtx.font = '12px monospace';
+        overlayCtx.font = `${OVERLAY_FONT_SIZE}px monospace`;
         overlayCtx.textBaseline = 'top';
 
         const regions = [
             { y: 0,              label: 'Spawn boundary (y=0)',        color: '#ff4444' },
-            { y: height * 0.10,  label: 'Convergence ramp end (10%)',  color: '#ffaa00' },
+            { y: height * CONVERGENCE_RAMP_RATIO,  label: `Convergence ramp end (${CONVERGENCE_RAMP_RATIO * 100}%)`,  color: '#ffaa00' },
             { y: height * DELTA_ZONE_END,      label: `Delta zone end (${DELTA_ZONE_END * 100}%)`,      color: '#44ff44' },
             { y: height * TRANSITION_ZONE_END, label: `Transition zone end (${TRANSITION_ZONE_END * 100}%)`, color: '#4488ff' },
         ];
@@ -1149,19 +1412,40 @@ function animate() {
             overlayCtx.fillText(r.label, 8, r.y + 4);
         }
 
-        // Draw mouse push circle
+        // Draw mouse push arc pill
         if (mouse.active) {
-            let pushRadius = 50;
-            overlayCtx.setLineDash(mouse.middleDown ? [] : [4, 4]);
-            overlayCtx.strokeStyle = mouse.middleDown ? 'rgba(255, 100, 100, 0.9)' : 'rgba(255, 100, 100, 0.6)';
+            let angle = mouse.pushAngle;
+            let dirX = Math.cos(angle);
+            let dirY = Math.sin(angle);
+            let acx = mouse.x - dirX * PUSH_ARC_RADIUS;
+            let acy = mouse.y - dirY * PUSH_ARC_RADIUS;
+            let midAngle = Math.atan2(dirY, dirX);
+            let half = PUSH_ARC_SPAN * 0.5;
+            let startA = midAngle - half;
+            let endA   = midAngle + half;
+
+            overlayCtx.setLineDash(mouse.leftDown ? [] : PUSH_ARC_DASH);
+            overlayCtx.strokeStyle = mouse.leftDown ? 'rgba(255, 100, 100, 0.9)' : 'rgba(255, 100, 100, 0.6)';
             overlayCtx.lineWidth = 1;
             overlayCtx.beginPath();
-            overlayCtx.arc(mouse.x, mouse.y, pushRadius, 0, Math.PI * 2);
+            // Outer arc (ARC_RADIUS + PILL_RADIUS from arc center)
+            overlayCtx.arc(acx, acy, PUSH_ARC_RADIUS + PUSH_PILL_RADIUS, startA, endA);
+            // Line cap connecting outer to inner at endA
+            let capCx = acx + PUSH_ARC_RADIUS * Math.cos(endA);
+            let capCy = acy + PUSH_ARC_RADIUS * Math.sin(endA);
+            overlayCtx.arc(capCx, capCy, PUSH_PILL_RADIUS, endA, endA + Math.PI);
+            // Inner arc (ARC_RADIUS - PILL_RADIUS, drawn in reverse)
+            overlayCtx.arc(acx, acy, PUSH_ARC_RADIUS - PUSH_PILL_RADIUS, endA, startA, true);
+            // Line cap connecting inner to outer at startA
+            let capSx = acx + PUSH_ARC_RADIUS * Math.cos(startA);
+            let capSy = acy + PUSH_ARC_RADIUS * Math.sin(startA);
+            overlayCtx.arc(capSx, capSy, PUSH_PILL_RADIUS, startA + Math.PI, startA);
+            overlayCtx.closePath();
             overlayCtx.stroke();
             overlayCtx.fillStyle = 'rgba(255, 100, 100, 0.05)';
             overlayCtx.fill();
             overlayCtx.fillStyle = '#ff6464';
-            overlayCtx.fillText('Push circle (r=50)', mouse.x + pushRadius + 10, mouse.y - 5);
+            overlayCtx.fillText('Push arc', mouse.x + 90, mouse.y - 90);
         }
 
         // River detection overlay
@@ -1209,7 +1493,7 @@ function animate() {
                     }
                 }
             }
-            overlayCtx.font = '11px monospace';
+            overlayCtx.font = `${COMP_LABEL_FONT_SIZE}px monospace`;
             overlayCtx.textBaseline = 'middle';
             for (let i = 0; i < numRiverComponents; i++) {
                 let ci = centroids[i];
@@ -1233,22 +1517,22 @@ function animate() {
             overlayCtx.strokeStyle = `rgb(${clr[0]}, ${clr[1]}, ${clr[2]})`;
             overlayCtx.lineWidth = 3;
             overlayCtx.beginPath();
-            overlayCtx.arc(co.x, co.y, 12, 0, Math.PI * 2);
+            overlayCtx.arc(co.x, co.y, CAP_ORIGIN_CIRCLE_RADIUS, 0, Math.PI * 2);
             overlayCtx.stroke();
         }
 
         // Component count label
         overlayCtx.fillStyle = '#ff8800';
-        overlayCtx.font = '12px monospace';
+        overlayCtx.font = `${OVERLAY_FONT_SIZE}px monospace`;
         overlayCtx.fillText(`River grid: ${numRiverComponents} component(s)`, 8, gridYStart - 8);
 
-        // Help bars at bottom
+        // Help bars — keyboard on bottom, mouse controls above
         overlayCtx.fillStyle = 'rgba(0, 0, 0, 0.6)';
-        overlayCtx.fillRect(0, height - 42, width, 42);
-        overlayCtx.font = '12px monospace';
+        overlayCtx.fillRect(0, height - HELP_BAR_HEIGHT, width, HELP_BAR_HEIGHT);
+        overlayCtx.font = `${OVERLAY_FONT_SIZE}px monospace`;
         overlayCtx.fillStyle = '#aaaaaa';
-        overlayCtx.fillText('Left click: hold to charge burst | Middle click: drag to push particles', 18, height - 32);
-        overlayCtx.fillText('D: debug | W: wetness | E: erosion | T: transparent | C: source colors | R: river sample | P: stats | \u2191\u2193: speed', 18, height - 14);
+        overlayCtx.fillText('Left click: push arc | Middle click: particle burst | Scroll/[]: sample size (R mode)', 15, height - 33);
+        overlayCtx.fillText('\u2191\u2193: speed | B: branching | C: colors | D: debug | E: erosion | P: stats | R: sample | T: transparent | W: wetness', 15, height - 15);
 
         overlayCtx.restore();
     }
@@ -1266,26 +1550,26 @@ function animate() {
         for (let r = 0; r < rows; r++) {
             for (let c = 0; c < cols; c++) {
                 let w = wetnessGrid[r * cols + c];
-                if (w < 0.5) continue;
+                if (w < HEATMAP_CELL_MIN_WETNESS) continue;
                 let t = w / maxW;
                 // Blue (low) → cyan → yellow → red (high)
                 let red, green, blue;
-                if (t < 0.33) {
-                    let s = t / 0.33;
+                if (t < HEATMAP_LOW_BREAK) {
+                    let s = t / HEATMAP_LOW_BREAK;
                     red = 0; green = Math.floor(s * 255); blue = 255;
-                } else if (t < 0.66) {
-                    let s = (t - 0.33) / 0.33;
+                } else if (t < HEATMAP_HIGH_BREAK) {
+                    let s = (t - HEATMAP_LOW_BREAK) / HEATMAP_LOW_BREAK;
                     red = Math.floor(s * 255); green = 255; blue = Math.floor((1 - s) * 255);
                 } else {
-                    let s = (t - 0.66) / 0.34;
+                    let s = (t - HEATMAP_HIGH_BREAK) / (1.0 - HEATMAP_HIGH_BREAK);
                     red = 255; green = Math.floor((1 - s) * 255); blue = 0;
                 }
-                overlayCtx.fillStyle = `rgba(${red}, ${green}, ${blue}, 0.5)`;
+                overlayCtx.fillStyle = `rgba(${red}, ${green}, ${blue}, ${HEATMAP_WETNESS_ALPHA})`;
                 overlayCtx.fillRect(c * GRID_SIZE, r * GRID_SIZE, GRID_SIZE, GRID_SIZE);
             }
         }
         // Label
-        overlayCtx.font = '12px monospace';
+        overlayCtx.font = `${OVERLAY_FONT_SIZE}px monospace`;
         overlayCtx.fillStyle = '#ffffff';
         overlayCtx.fillText(`WETNESS (max: ${maxW.toFixed(1)})`, 8, 16);
         overlayCtx.restore();
@@ -1302,22 +1586,22 @@ function animate() {
         for (let r = 0; r < rows; r++) {
             for (let c = 0; c < cols; c++) {
                 let e = erosionGrid[r * cols + c];
-                if (e < 0.005) continue;
+                if (e < HEATMAP_CELL_MIN_EROSION) continue;
                 let t = e / maxE;
                 // Purple (low) → orange (mid) → white (high)
                 let red, green, blue;
-                if (t < 0.5) {
-                    let s = t / 0.5;
-                    red = Math.floor(128 + s * 127); green = Math.floor(s * 165); blue = Math.floor(200 * (1 - s));
+                if (t < EROSION_MID_BREAK) {
+                    let s = t / EROSION_MID_BREAK;
+                    red = Math.floor(EROSION_BASE_R + s * EROSION_RANGE_R); green = Math.floor(s * EROSION_BASE_G_HIGH); blue = Math.floor(EROSION_BASE_B * (1 - s));
                 } else {
-                    let s = (t - 0.5) / 0.5;
-                    red = 255; green = Math.floor(165 + s * 90); blue = Math.floor(s * 255);
+                    let s = (t - EROSION_MID_BREAK) / EROSION_MID_BREAK;
+                    red = 255; green = Math.floor(EROSION_BASE_G_HIGH + s * EROSION_RANGE_G_HIGH); blue = Math.floor(s * 255);
                 }
-                overlayCtx.fillStyle = `rgba(${red}, ${green}, ${blue}, 0.6)`;
+                overlayCtx.fillStyle = `rgba(${red}, ${green}, ${blue}, ${HEATMAP_EROSION_ALPHA})`;
                 overlayCtx.fillRect(c * GRID_SIZE, r * GRID_SIZE, GRID_SIZE, GRID_SIZE);
             }
         }
-        overlayCtx.font = '12px monospace';
+        overlayCtx.font = `${OVERLAY_FONT_SIZE}px monospace`;
         overlayCtx.fillStyle = '#ffffff';
         overlayCtx.fillText(`EROSION (max: ${maxE.toFixed(1)})`, 8, wetnessOverlay ? 64 : 16);
         overlayCtx.restore();
@@ -1334,17 +1618,17 @@ function animate() {
         for (let r = 0; r < rows; r++) {
             for (let c = 0; c < cols; c++) {
                 let w = capWetnessGrid[r * cols + c];
-                if (w < 0.5) continue;
+                if (w < HEATMAP_CELL_MIN_WETNESS) continue;
                 let t = w / maxCW;
                 // Dark red (low) → orange (mid) → bright red (high)
-                let red = Math.floor(180 + t * 75);
-                let green = Math.floor(t * 100);
+                let red = Math.floor(CAP_WETNESS_BASE_R + t * CAP_WETNESS_RANGE_R);
+                let green = Math.floor(t * CAP_WETNESS_RANGE_G);
                 let blue = 0;
-                overlayCtx.fillStyle = `rgba(${red}, ${green}, ${blue}, 0.5)`;
+                overlayCtx.fillStyle = `rgba(${red}, ${green}, ${blue}, ${HEATMAP_WETNESS_ALPHA})`;
                 overlayCtx.fillRect(c * GRID_SIZE, r * GRID_SIZE, GRID_SIZE, GRID_SIZE);
             }
         }
-        overlayCtx.font = '12px monospace';
+        overlayCtx.font = `${OVERLAY_FONT_SIZE}px monospace`;
         overlayCtx.fillStyle = '#ff8844';
         overlayCtx.fillText(`CAP WETNESS (max: ${maxCW.toFixed(1)})`, 8, 32);  // line 2 (river wetness at 16)
         overlayCtx.restore();
@@ -1361,17 +1645,17 @@ function animate() {
         for (let r = 0; r < rows; r++) {
             for (let c = 0; c < cols; c++) {
                 let e = capErosionGrid[r * cols + c];
-                if (e < 0.005) continue;
+                if (e < HEATMAP_CELL_MIN_EROSION) continue;
                 let t = e / maxCE;
                 // Dark red (low) → bright red-orange (high)
                 let red = 255;
-                let green = Math.floor(t * 80);
-                let blue = Math.floor(t * 30);
-                overlayCtx.fillStyle = `rgba(${red}, ${green}, ${blue}, 0.6)`;
+                let green = Math.floor(t * CAP_EROSION_RANGE_G);
+                let blue = Math.floor(t * CAP_EROSION_RANGE_B);
+                overlayCtx.fillStyle = `rgba(${red}, ${green}, ${blue}, ${HEATMAP_EROSION_ALPHA})`;
                 overlayCtx.fillRect(c * GRID_SIZE, r * GRID_SIZE, GRID_SIZE, GRID_SIZE);
             }
         }
-        overlayCtx.font = '12px monospace';
+        overlayCtx.font = `${OVERLAY_FONT_SIZE}px monospace`;
         overlayCtx.fillStyle = '#ff6633';
         let yOff = wetnessOverlay ? 80 : 32;  // after river erosion label
         overlayCtx.fillText(`CAP EROSION (max: ${maxCE.toFixed(1)})`, 8, yOff);
@@ -1379,22 +1663,38 @@ function animate() {
     }
 
     // River sample mode overlay (independent of debugOverlay)
-    if (riverSampleMode) {
+    if (riverSampleMode && mouse.active) {
+        let sz = riverSampleSize;
+        let sampleRect = { x: mouse.x - sz, y: mouse.y - sz, w: sz * 2, h: sz * 2 };
+        riverSampleStats = computeRiverSampleStats(sampleRect);
+
+        // Count particles inside the sample rect by type
+        let pRiver = 0, pCapillary = 0, pSource = 0, pTotal = 0;
+        let rx0 = sampleRect.x, ry0 = sampleRect.y;
+        let rx1 = rx0 + sampleRect.w, ry1 = ry0 + sampleRect.h;
+        for (let i = 0; i < particles.length; i++) {
+            let p = particles[i];
+            if (p.x >= rx0 && p.x <= rx1 && p.y >= ry0 && p.y <= ry1) {
+                pTotal++;
+                if (p.isCapillary) pCapillary++;
+                else if (p.isSource) pSource++;
+                else pRiver++;
+            }
+        }
+
         overlayCtx.save();
         // Mode label
-        overlayCtx.font = '14px monospace';
+        overlayCtx.font = `${OVERLAY_FONT_SIZE_LG}px monospace`;
         overlayCtx.fillStyle = '#00ffff';
-        overlayCtx.fillText('RIVER SAMPLE MODE (R to exit)', 8, height - 12);
+        overlayCtx.fillText(`RIVER SAMPLE MODE (R to exit) [/] or scroll to resize (${sz * 2}px)`, 8, height - 12);
 
-        // Draw rectangle
-        if (riverSampleRect && riverSampleRect.w > 0 && riverSampleRect.h > 0) {
-            overlayCtx.strokeStyle = '#00ffff';
-            overlayCtx.lineWidth = 2;
-            overlayCtx.setLineDash([]);
-            overlayCtx.strokeRect(riverSampleRect.x, riverSampleRect.y, riverSampleRect.w, riverSampleRect.h);
-            overlayCtx.fillStyle = 'rgba(0, 255, 255, 0.08)';
-            overlayCtx.fillRect(riverSampleRect.x, riverSampleRect.y, riverSampleRect.w, riverSampleRect.h);
-        }
+        // Draw square
+        overlayCtx.strokeStyle = '#00ffff';
+        overlayCtx.lineWidth = 2;
+        overlayCtx.setLineDash([]);
+        overlayCtx.strokeRect(sampleRect.x, sampleRect.y, sampleRect.w, sampleRect.h);
+        overlayCtx.fillStyle = 'rgba(0, 255, 255, 0.08)';
+        overlayCtx.fillRect(sampleRect.x, sampleRect.y, sampleRect.w, sampleRect.h);
 
         // Draw stats panel
         if (riverSampleStats) {
@@ -1405,35 +1705,66 @@ function animate() {
                 `Grid: cols ${s.col0}-${s.col1}, rows ${s.row0}-${s.row1}`,
                 `Pixels: ${s.pixelCount}`,
                 ``,
+                `Particles: ${pTotal} (river: ${pRiver}, capillary: ${pCapillary}, delta: ${pSource})`,
+                ``,
+                ...(() => {
+                    let gc0 = Math.max(0, Math.floor(sampleRect.x / GRID_SIZE));
+                    let gc1 = Math.min(cols - 1, Math.floor((sampleRect.x + sampleRect.w) / GRID_SIZE));
+                    let gr0 = Math.max(0, Math.floor(sampleRect.y / GRID_SIZE));
+                    let gr1 = Math.min(rows - 1, Math.floor((sampleRect.y + sampleRect.h) / GRID_SIZE));
+                    let wSum = 0, wMax = 0, eSum = 0, eMax = 0;
+                    let cwSum = 0, cwMax = 0, ceSum = 0, ceMax = 0;
+                    let cnt = 0;
+                    for (let r = gr0; r <= gr1; r++) {
+                        for (let c = gc0; c <= gc1; c++) {
+                            let i = r * cols + c;
+                            let w = wetnessGrid[i], e = erosionGrid[i];
+                            let cw = capWetnessGrid[i], ce = capErosionGrid[i];
+                            wSum += w; if (w > wMax) wMax = w;
+                            eSum += e; if (e > eMax) eMax = e;
+                            cwSum += cw; if (cw > cwMax) cwMax = cw;
+                            ceSum += ce; if (ce > ceMax) ceMax = ce;
+                            cnt++;
+                        }
+                    }
+                    let avg = (v) => cnt ? (v / cnt).toFixed(2) : '0';
+                    return [
+                        `Wetness:     avg=${avg(wSum)} max=${wMax.toFixed(2)}`,
+                        `Erosion:     avg=${avg(eSum)} max=${eMax.toFixed(2)}`,
+                        `Cap Wetness: avg=${avg(cwSum)} max=${cwMax.toFixed(2)}`,
+                        `Cap Erosion: avg=${avg(ceSum)} max=${ceMax.toFixed(2)}`,
+                    ];
+                })(),
+                ``,
                 `R: min=${s.r.min} max=${s.r.max} mean=${s.r.mean} med=${s.r.median}`,
                 `G: min=${s.g.min} max=${s.g.max} mean=${s.g.mean} med=${s.g.median}`,
                 `B: min=${s.b.min} max=${s.b.max} mean=${s.b.mean} med=${s.b.median}`,
                 ``,
                 `Brightness histogram:`,
                 `  0      : ${s.buckets[0]} (${pct(s.buckets[0])}%)`,
-                `  1-15   : ${s.buckets[1]} (${pct(s.buckets[1])}%)`,
-                `  16-50  : ${s.buckets[2]} (${pct(s.buckets[2])}%)`,
-                `  51-128 : ${s.buckets[3]} (${pct(s.buckets[3])}%)`,
-                `  129-255: ${s.buckets[4]} (${pct(s.buckets[4])}%)`,
+                `  1-${BRIGHTNESS_BUCKET_1}   : ${s.buckets[1]} (${pct(s.buckets[1])}%)`,
+                `  ${BRIGHTNESS_BUCKET_1 + 1}-${BRIGHTNESS_BUCKET_2}  : ${s.buckets[2]} (${pct(s.buckets[2])}%)`,
+                `  ${BRIGHTNESS_BUCKET_2 + 1}-${BRIGHTNESS_BUCKET_3} : ${s.buckets[3]} (${pct(s.buckets[3])}%)`,
+                `  ${BRIGHTNESS_BUCKET_3 + 1}-255: ${s.buckets[4]} (${pct(s.buckets[4])}%)`,
                 ``,
                 `>= threshold (${s.threshold}): ${s.aboveThreshold} (${pct(s.aboveThreshold)}%)`,
                 ``,
                 `Column detection (avg red >= ${s.threshold}):`,
                 `  Columns passing: ${s.passingCols}/${s.colCount}`,
-                `  River runs (>= 3 wide): ${s.riverRuns.length}`,
+                `  River runs (>= ${RIVER_RUN_MIN_WIDTH} wide): ${s.riverRuns.length}`,
                 ...s.riverRuns.map((r, i) => `    #${i + 1}: cols ${r.left}-${r.right} (${r.right - r.left + 1} wide)`),
                 ``,
                 s.riverRuns.length > 0 ? `  PASS — ${s.riverRuns.length} river(s) detected` : `  FAIL — no rivers detected`
             ];
-            let lineH = 16;
-            let panelW = 380;
-            let panelH = lines.length * lineH + 16;
+            let lineH = STATS_LINE_HEIGHT;
+            let panelW = SAMPLE_STATS_PANEL_W;
+            let panelH = lines.length * lineH + STATS_PANEL_PADDING;
             overlayCtx.fillStyle = 'rgba(0, 0, 0, 0.85)';
             overlayCtx.fillRect(8, 8, panelW, panelH);
             overlayCtx.strokeStyle = '#00ffff';
             overlayCtx.lineWidth = 1;
             overlayCtx.strokeRect(8, 8, panelW, panelH);
-            overlayCtx.font = '12px monospace';
+            overlayCtx.font = `${OVERLAY_FONT_SIZE}px monospace`;
             let verdictIdx = lines.length - 1;
             for (let i = 0; i < lines.length; i++) {
                 if (i === verdictIdx) {
@@ -1452,11 +1783,17 @@ function animate() {
         let total = particles.length;
         let river = 0, capillary = 0, source = 0;
         let onCanvas = 0, offCanvas = 0;
+        let aboveCanvas = 0, belowCanvas = 0;
+        let inDeltaCount = 0, inTransCount = 0, inRiverCount = 0;
+        let deltaEnd = height * DELTA_ZONE_END;
+        let transEnd = height * TRANSITION_ZONE_END;
         for (let p of particles) {
             if (p.x >= 0 && p.x <= width && p.y >= 0 && p.y <= height) {
                 onCanvas++;
             } else {
                 offCanvas++;
+                if (p.y < 0) aboveCanvas++;
+                else if (p.y > height) belowCanvas++;
             }
             if (p.isCapillary) {
                 capillary++;
@@ -1464,19 +1801,34 @@ function animate() {
                 river++;
                 if (p.isSource) source++;
             }
+            if (p.y < 0) { /* counted above */ }
+            else if (p.y < deltaEnd) inDeltaCount++;
+            else if (p.y < transEnd) inTransCount++;
+            else if (p.y <= height) inRiverCount++;
         }
         let lines = [
             `PARTICLE STATS (P to hide)`,
             ``,
-            `Total: ${total}  (on canvas: ${onCanvas}, off: ${offCanvas})`,
-            `River: ${river}  (source: ${source})`,
-            `Capillary: ${capillary}`,
+            `Total: ${total}  (Delta min: ${source})`,
+            `River: ${river}`,
+            `Capillary: ${capillary}  Diversion: ${capillaryDiversion ? 'ON' : 'OFF'} (B)  Threshold: ${CAPILLARY_DIVERSION_THRESHOLD}`,
             `Origins: ${capillaryOrigins.length}`,
+            ``,
+            `CANVAS`,
+            `  On:    ${onCanvas}`,
+            `  Above: ${aboveCanvas}`,
+            `  Below: ${belowCanvas}`,
+            ``,
+            `REGIONS`,
+            `  Delta (0-${(DELTA_ZONE_END*100).toFixed(0)}%):       ${inDeltaCount}`,
+            `  Transition (${(DELTA_ZONE_END*100).toFixed(0)}-${(TRANSITION_ZONE_END*100).toFixed(0)}%): ${inTransCount}`,
+            `  River (${(TRANSITION_ZONE_END*100).toFixed(0)}-100%):     ${inRiverCount}`,
+            ``,
             `FPS: ${smoothFPS.toFixed(1)}  Speed: ${simSpeed}x (Up/Down)`,
         ];
-        let lineH = 16;
-        let panelW = 420;
-        let panelH = lines.length * lineH + 16;
+        let lineH = STATS_LINE_HEIGHT;
+        let panelW = PARTICLE_STATS_PANEL_W;
+        let panelH = lines.length * lineH + STATS_PANEL_PADDING;
         let panelX = width - panelW - 8;
         overlayCtx.save();
         overlayCtx.fillStyle = 'rgba(0, 0, 0, 0.85)';
@@ -1484,7 +1836,7 @@ function animate() {
         overlayCtx.strokeStyle = '#00ff88';
         overlayCtx.lineWidth = 1;
         overlayCtx.strokeRect(panelX, 8, panelW, panelH);
-        overlayCtx.font = '12px monospace';
+        overlayCtx.font = `${OVERLAY_FONT_SIZE}px monospace`;
         overlayCtx.fillStyle = '#00ff88';
         for (let i = 0; i < lines.length; i++) {
             overlayCtx.fillText(lines[i], panelX + 8, 24 + i * lineH);
@@ -1499,13 +1851,6 @@ function animate() {
 }
 
 canvas.addEventListener('mousemove', (e) => {
-    if (riverSampleMode && riverSampleDragging && riverSampleStart) {
-        let sx = Math.min(riverSampleStart.x, e.clientX);
-        let sy = Math.min(riverSampleStart.y, e.clientY);
-        let sw = Math.abs(e.clientX - riverSampleStart.x);
-        let sh = Math.abs(e.clientY - riverSampleStart.y);
-        riverSampleRect = { x: sx, y: sy, w: sw, h: sh };
-    }
     let dx = e.clientX - mouse.x;
     let dy = e.clientY - mouse.y;
     mouse.frameDX += dx;
@@ -1517,51 +1862,60 @@ canvas.addEventListener('mousemove', (e) => {
 
 canvas.addEventListener('mouseleave', () => {
     mouse.active = false;
-    mouse.middleDown = false;
+    mouse.leftDown = false;
 });
 
 // Prevent default middle-click auto-scroll
 canvas.addEventListener('auxclick', (e) => { if (e.button === 1) e.preventDefault(); });
 
+// Scroll wheel resizes river sample square
+canvas.addEventListener('wheel', (e) => {
+    if (!riverSampleMode) return;
+    e.preventDefault();
+    let delta = e.deltaY > 0 ? -SAMPLE_SCROLL_STEP : SAMPLE_SCROLL_STEP;
+    riverSampleSize = Math.max(SAMPLE_SIZE_MIN, Math.min(SAMPLE_SIZE_MAX, riverSampleSize + delta));
+}, { passive: false });
+
 canvas.addEventListener('mousedown', (e) => {
-    if (e.button === 1) { mouse.middleDown = true; e.preventDefault(); return; }
-    if (e.button !== 0) return;
-    if (riverSampleMode) {
-        riverSampleDragging = true;
-        riverSampleStart = { x: e.clientX, y: e.clientY };
-        riverSampleRect = { x: e.clientX, y: e.clientY, w: 0, h: 0 };
-        riverSampleStats = null;
+    if (e.button === 0) {
+        mouse.leftDown = true;
         return;
     }
-    burst.charging = true;
-    burst.x = e.clientX;
-    burst.y = e.clientY;
-    burst.startTime = performance.now();
+    if (e.button === 1) {
+        e.preventDefault();
+        burst.charging = true;
+        burst.x = e.clientX;
+        burst.y = e.clientY;
+        burst.startTime = performance.now();
+        return;
+    }
 });
 
 canvas.addEventListener('mouseup', (e) => {
-    if (e.button === 1) { mouse.middleDown = false; return; }
-    if (riverSampleMode && riverSampleDragging) {
-        riverSampleDragging = false;
-        if (riverSampleRect && riverSampleRect.w > 2 && riverSampleRect.h > 2) {
-            riverSampleStats = computeRiverSampleStats(riverSampleRect);
+    if (e.button === 0) { mouse.leftDown = false; return; }
+    if (e.button === 1) {
+        if (!burst.charging) return;
+        burst.charging = false;
+        let elapsed = performance.now() - burst.startTime;
+        let t = Math.min(elapsed / BURST_CHARGE_TIME, 1.0);
+        let radius = BURST_MIN_RADIUS + (BURST_MAX_RADIUS - BURST_MIN_RADIUS) * t;
+        let count = Math.floor(BURST_COUNT + (BURST_COUNT * BURST_MAX_MULTIPLIER) * t);
+        let stolen = 0;
+        for (let i = 0; i < particles.length && stolen < count; i++) {
+            let p = particles[i];
+            if (!p.isSource || !p.inDelta) continue;
+            let angle = Math.random() * Math.PI * 2;
+            let r = Math.random() * radius;
+            p.x = burst.x + Math.cos(angle) * r;
+            p.y = burst.y + Math.sin(angle) * r;
+            p.isSource = false;
+            p.inDelta = false;
+            p.age = 0;
+            p.life = PARTICLE_LIFE_BASE + Math.random() * PARTICLE_LIFE_VAR;
+            p.vx = 0;
+            p.vy = 0;
+            stolen++;
         }
-        return;
-    }
-    if (!burst.charging) return;
-    burst.charging = false;
-    let elapsed = performance.now() - burst.startTime;
-    let t = Math.min(elapsed / BURST_CHARGE_TIME, 1.0);
-    let radius = BURST_MIN_RADIUS + (BURST_MAX_RADIUS - BURST_MIN_RADIUS) * t;
-    let count = Math.floor(BURST_COUNT + (BURST_COUNT * 4) * t); // 200 to 1000
-    for (let i = 0; i < count; i++) {
-        let p = new Particle();
-        let angle = Math.random() * Math.PI * 2;
-        let r = Math.random() * radius;
-        p.x = burst.x + Math.cos(angle) * r;
-        p.y = burst.y + Math.sin(angle) * r;
-        p.isSource = false;
-        particles.push(p);
     }
 });
 
@@ -1572,20 +1926,15 @@ window.addEventListener('keydown', (e) => {
     if (e.key === 'p' || e.key === 'P') particleStatsOverlay = !particleStatsOverlay;
     if (e.key === 't' || e.key === 'T') transparentParticles = !transparentParticles;
     if (e.key === 'c' || e.key === 'C') sourceColorParticles = !sourceColorParticles;
+    if (e.key === 'b' || e.key === 'B') capillaryDiversion = !capillaryDiversion;
     if (e.key === 'ArrowUp') simSpeed = Math.min(simSpeed + 1, 5);
     if (e.key === 'ArrowDown') simSpeed = Math.max(simSpeed - 1, 1);
     if (e.key === 'r' || e.key === 'R') {
         riverSampleMode = !riverSampleMode;
-        if (!riverSampleMode) {
-            riverSampleRect = null;
-            riverSampleDragging = false;
-            riverSampleStart = null;
-            riverSampleStats = null;
-        } else {
-            riverSampleRect = null;
-            riverSampleStats = null;
-        }
+        riverSampleStats = null;
     }
+    if (e.key === '[') riverSampleSize = Math.max(SAMPLE_SIZE_MIN, riverSampleSize - SAMPLE_SCROLL_STEP);
+    if (e.key === ']') riverSampleSize = Math.min(SAMPLE_SIZE_MAX, riverSampleSize + SAMPLE_SCROLL_STEP);
 });
 
 animate();

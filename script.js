@@ -12,7 +12,7 @@ let erosionOverlay = false; // Toggle with 'E' key
 let particleStatsOverlay = false; // Toggle with 'P' key
 let transparentParticles = false; // Toggle with 'T' key
 let sourceColorParticles = false; // Toggle with 'C' key
-let capillaryDiversion = true;     // Toggle with 'B' key — capillary branching on/off
+let capillaryDiversion = false;     // Toggle with 'B' key — capillary branching on/off
 let deltaParticleCount = 0;        // updated each tick — particles in delta zone
 let riverZoneParticleCount = 0;    // updated each tick — non-source particles (incl. capillaries) in river zone
 let riverSampleMode = false;       // toggled by 'R' key
@@ -92,10 +92,10 @@ const FADE_FAST_AMOUNT = 6;
 
 // --- Capillary Ants ---
 const CAPILLARY_LATERAL_FORCE = 1.2;
-const CAPILLARY_GRAVITY = 0.4;
+const CAPILLARY_GRAVITY = 0.1;
 const CAPILLARY_MAX_OPACITY = 0.8;
 const CAPILLARY_MAX_RADIUS = 1.4;
-const CAPILLARY_WIGGLE_STRENGTH = 0.20;
+const CAPILLARY_WIGGLE_STRENGTH = 0.01;
 
 // --- Capillary Wetness/Erosion (isolated grids) ---
 const CAP_WETNESS_DEPOSIT    = 0.15;
@@ -104,8 +104,8 @@ const CAP_EROSION_MAX        = 15.0;
 const CAP_EVAPORATION_RATE   = 0.985;
 const CAP_EROSION_DECAY      = 0.999;
 const CAP_SCAN_RADIUS        = 30;
-const CAP_EROSION_SPREAD     = 0.4;
-const CAP_ATTRACT_SCALE      = 0.15;
+const CAP_EROSION_SPREAD     = 0.02;
+const CAP_ATTRACT_SCALE      = 1.0;
 
 // --- Zone Boundaries ---
 const DELTA_ZONE_END = 0.30;
@@ -177,9 +177,9 @@ const CAP_WIGGLE_FREQ_BASE   = 0.04;
 const CAP_WIGGLE_FREQ_VAR    = 0.06;
 const CAP_LATERAL_SCALE      = 0.4;
 const CAP_LATERAL_DECAY_DIST = 400;
-const CAP_VERTICAL_SCAN      = 2;
+const CAP_VERTICAL_SCAN      = 4;
 const CAP_CHANNEL_THRESHOLD  = 0.1;
-const CAP_FRICTION           = 0.94;
+const CAP_FRICTION           = 0.85;
 const CAP_MAX_SPEED          = 3.0;
 const CAP_FADE_IN_FRAMES     = 20;
 const MAX_RECYCLED_CAPILLARIES = 8000;
@@ -459,7 +459,7 @@ class Particle {
             if (convergeFactor > 0) {
                 let attractLeft = 0, attractRight = 0;
                 let repulseLeft = 0, repulseRight = 0;
-                let inPostTransition = this.y >= height * TRANSITION_ZONE_END;
+                let inPostTransition = this.y >= height * CONVERGENCE_RAMP_RATIO;
 
                 // Scan left
                 for (let s = 1; s <= STREAM_SCAN_RADIUS; s++) {

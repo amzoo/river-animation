@@ -1492,7 +1492,7 @@ function animate() {
     }
 
     // Debug overlay: dotted lines at vertical region boundaries (drawn on separate canvas)
-    const overlayActive = debugOverlay || wetnessOverlay || erosionOverlay || riverSampleMode;
+    const overlayActive = debugOverlay || wetnessOverlay || erosionOverlay || riverSampleMode || particleStatsOverlay;
     if (overlayActive || _prevOverlayActive) {
         overlayCtx.clearRect(0, 0, width, height);
     }

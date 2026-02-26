@@ -13,6 +13,7 @@ let particleStatsOverlay = false; // Toggle with 'P' key
 let transparentParticles = false; // Toggle with 'T' key
 let sourceColorParticles = false; // Toggle with 'C' key
 let capillaryDiversion = false;     // Toggle with 'B' key — capillary branching on/off
+let mixSources = true;              // Toggle with 'M' key — disable river repulsion to mix foreign sources
 let deltaParticleCount = 0;        // updated each tick — particles in delta zone
 let riverZoneParticleCount = 0;    // updated each tick — non-source particles (incl. capillaries) in river zone
 let riverSampleMode = false;       // toggled by 'R' key
@@ -118,7 +119,7 @@ const PUSH_ARC_RADIUS = 300;   // curvature radius (larger = flatter)
 const PUSH_ARC_SPAN   = 1.0;   // angular span in radians (~57 deg)
 const PUSH_PILL_RADIUS = 10;   // thickness around the arc
 
-const RIVER_REPULSE_STRENGTH = 6.0;  // multiplier for foreign-source repulsion
+const RIVER_REPULSE_STRENGTH = 60.0;  // multiplier for foreign-source repulsion
 
 // --- Sources & Spawning ---
 const NUM_SOURCES = 7;
@@ -489,7 +490,7 @@ class Particle {
 
                 // Attract toward own river, repulse from other rivers across gaps
                 let pullX = (attractRight - attractLeft);
-                let repulseX = (repulseLeft - repulseRight) * RIVER_REPULSE_STRENGTH;
+                let repulseX = mixSources ? 0 : (repulseLeft - repulseRight) * RIVER_REPULSE_STRENGTH;
                 let netX = pullX + repulseX;
 
                 let pullAbs = Math.abs(netX);
@@ -1634,7 +1635,7 @@ function animate() {
         overlayCtx.font = `${OVERLAY_FONT_SIZE}px monospace`;
         overlayCtx.fillStyle = '#aaaaaa';
         overlayCtx.fillText('Left click: push arc | Middle click: particle burst | Scroll/[]: sample size (R mode)', 15, height - 33);
-        overlayCtx.fillText('\u2191\u2193: speed | B: branching | C: colors | D: debug | E: erosion | P: stats | R: sample | T: transparent | W: wetness', 15, height - 15);
+        overlayCtx.fillText('\u2191\u2193: speed | B: branching | C: colors | D: debug | E: erosion | M: mix | P: stats | R: sample | T: transparent | W: wetness', 15, height - 15);
 
         overlayCtx.restore();
     }
@@ -1913,7 +1914,7 @@ function animate() {
             ``,
             `Total: ${total}  (Delta min: ${source})`,
             `River: ${river}`,
-            `Capillary: ${capillary}/${MAX_RECYCLED_CAPILLARIES}  Diversion: ${capillaryDiversion ? 'ON' : 'OFF'} (B)  Threshold: ${CAPILLARY_DIVERSION_THRESHOLD}`,
+            `Capillary: ${capillary}/${MAX_RECYCLED_CAPILLARIES}  Diversion: ${capillaryDiversion ? 'ON' : 'OFF'} (B)  Mix: ${mixSources ? 'ON' : 'OFF'} (M)`,
             `Origins: ${capillaryOrigins.length}`,
             ``,
             `CANVAS`,
@@ -2029,6 +2030,7 @@ window.addEventListener('keydown', (e) => {
     if (e.key === 't' || e.key === 'T') transparentParticles = !transparentParticles;
     if (e.key === 'c' || e.key === 'C') sourceColorParticles = !sourceColorParticles;
     if (e.key === 'b' || e.key === 'B') capillaryDiversion = !capillaryDiversion;
+    if (e.key === 'm' || e.key === 'M') mixSources = !mixSources;
     if (e.key === 'ArrowUp') simSpeed = Math.min(simSpeed + 1, 5);
     if (e.key === 'ArrowDown') simSpeed = Math.max(simSpeed - 1, 1);
     if (e.key === 'r' || e.key === 'R') {

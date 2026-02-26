@@ -33,3 +33,11 @@ No build step required. Open `index.html` in any modern browser.
 | `W` | Toggle wetness heatmap |
 | `↑/↓` | Adjust sim speed (0.1x – 5x, default 1x) |
 | `[/]` | Adjust sample size (R mode) |
+
+## Mouse Controls
+
+| Input | Action |
+|-------|--------|
+| Left click | Push arc — deflects nearby particles |
+| Middle click | Particle burst |
+| Scroll wheel | Adjust sample size (R mode) |

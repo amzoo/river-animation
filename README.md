@@ -2,7 +2,7 @@
 
 A generative art simulation of natural river formation, erosion, and capillary branching — rendered in real time with vanilla HTML5 Canvas.
 
-<video src="demo.mp4" alt="Example Animation" autoplay loop muted playsinline width="100%"></video>
+![Example Animation](demo.webp)
 
 ## Overview
 

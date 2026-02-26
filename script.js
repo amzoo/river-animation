@@ -19,6 +19,7 @@ let riverSampleMode = false;       // toggled by 'R' key
 let _prevOverlayActive = false;    // tracks overlay state for lazy clear
 let riverSampleSize = 100;         // half-size of the sample square (pixels)
 let riverSampleStats = null;       // computed stats object, displayed on overlay
+let frameDiversions = 0;           // per-tick capillary diversion counter
 // ==========================================
 // CONFIGURATION & TUNING VARIABLES
 // ==========================================
@@ -91,7 +92,7 @@ const FADE_FAST_AMOUNT = 6;
 
 // --- Capillary Ants ---
 const CAPILLARY_DIVERT_RADIUS = 20;
-const CAPILLARY_DIVERT_FRACTION = 0.15;
+const CAPILLARY_DIVERT_FRACTION = 0.40;
 const CAPILLARY_DIVERT_MIN_WETNESS = 8.0;
 const CAPILLARY_DIVERT_WETNESS_COMPENSATION = 3.0;
 const CAPILLARY_LATERAL_FORCE = 1.2;
@@ -175,6 +176,7 @@ const OOB_MARGIN            = 50;
 
 // --- Capillary Diversion ---
 const CAPILLARY_DIVERSION_THRESHOLD = 10000;
+const CAPILLARY_DIVERSIONS_PER_FRAME = 3;
 
 // --- Capillary Physics ---
 const CAP_WIGGLE_FREQ_BASE   = 0.04;
@@ -597,7 +599,7 @@ class Particle {
 
         // Capillary diversion: non-source river particles near a capillary origin
         // may fork off into capillary mode
-        if (!this.isSource && capillaryDiversion && riverZoneParticleCount > CAPILLARY_DIVERSION_THRESHOLD) {
+        if (!this.isSource && capillaryDiversion && riverZoneParticleCount > CAPILLARY_DIVERSION_THRESHOLD && frameDiversions < CAPILLARY_DIVERSIONS_PER_FRAME) {
             for (let o of capillaryOrigins) {
                 let cdx = this.x - o.x;
                 let cdy = this.y - o.y;
@@ -611,6 +613,7 @@ class Particle {
                     if (localWetness < CAPILLARY_DIVERT_MIN_WETNESS) break;
 
                     if (Math.random() < CAPILLARY_DIVERT_FRACTION) {
+                        frameDiversions++;
                         this.isCapillary = true;
                         this.capillaryDir = o.leftOk && !o.rightOk ? -1 : (!o.leftOk && o.rightOk ? 1 : (Math.random() < 0.5 ? -1 : 1));
                         this.streamId = o.sourceIdx * 2 + (this.capillaryDir > 0 ? 1 : 0) + 1;
@@ -784,7 +787,8 @@ class Particle {
         this.drawOpacity = CAPILLARY_MAX_OPACITY * fadeIn;
 
         // River absorption: revert to river particle on contact
-        {
+        // Grace period during fade-in so capillaries can move away from their origin river
+        if (this.age > CAP_FADE_IN_FRAMES) {
             let rzYStart = Math.floor(height * TRANSITION_ZONE_END);
             let rr = Math.floor((this.y - rzYStart) / RIVER_CELL_SIZE);
             let rc = Math.floor(this.x / RIVER_CELL_SIZE);
@@ -965,7 +969,7 @@ function updateRiverGrid() {
             if (maxW >= RIVER_WETNESS_THRESHOLD && cellCounts[idx] >= RIVER_PARTICLE_THRESHOLD) {
                 riverCellLastSeen[idx] = now;
                 riverGrid[idx] = 1;
-            } else if (now - riverCellLastSeen[idx] < RIVER_CELL_TIMEOUT) {
+            } else if (riverCellLastSeen[idx] > 0 && now - riverCellLastSeen[idx] < RIVER_CELL_TIMEOUT) {
                 riverGrid[idx] = 1;
             }
         }
@@ -1238,6 +1242,7 @@ function animate() {
         // Grid-based river detection (transition zone to bottom)
         updateRiverGrid();
 
+        frameDiversions = 0;
         for (let i = 0; i < particles.length; i++) {
             particles[i].update();
         }

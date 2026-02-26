@@ -11,7 +11,7 @@ Thousands of particles trace paths through a shifting noise-based flow field, de
 Key techniques:
 - **Fractional Brownian Motion (fBm)** via Simplex Noise for the underlying terrain
 - **Wetness and erosion grids** that accumulate over time and influence particle behavior
-- **Capillary pheromone trails** that attract nearby particles into branching tributaries
+- **Capillary branching** with isolated wetness/erosion grids that form tributaries off main rivers
 - **Mouse interaction** — cursor acts as a flow source with burst mechanics
 
 ## How to Run
@@ -22,9 +22,14 @@ No build step required. Open `index.html` in any modern browser.
 
 | Key | Action |
 |-----|--------|
-| `D` | Toggle debug overlay (flow field, origins) |
-| `W` | Toggle wetness heatmap |
-| `E` | Toggle erosion heatmap |
-| `T` | Toggle transparent particles |
+| `B` | Toggle capillary diversion on/off |
 | `C` | Toggle source-colored particles |
+| `D` | Toggle debug overlay (flow field, origins) |
+| `E` | Toggle erosion heatmap |
+| `M` | Toggle source mixing (disable river repulsion) |
+| `P` | Toggle particle stats overlay |
 | `R` | River sample mode (drag to select region) |
+| `T` | Toggle transparent particles |
+| `W` | Toggle wetness heatmap |
+| `↑/↓` | Adjust sim speed (0.1x – 5x, default 1x) |
+| `[/]` | Adjust sample size (R mode) |

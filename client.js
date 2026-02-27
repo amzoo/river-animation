@@ -58,6 +58,10 @@ let fadeToggle = false;
 let lastFrameNum = 0;
 let frameNum = 0;
 
+// Fade-in after connect: ramp particle opacity from 0→1 over this many RAF frames
+const CONNECT_FADE_IN_FRAMES = 180; // ~3 seconds at 60fps
+let connectFadeFrame = 0;
+
 function showStatus(msg, autoHide) {
     statusEl.textContent = msg;
     statusEl.classList.remove('hidden');
@@ -74,6 +78,7 @@ function connect() {
 
     ws.onopen = () => {
         connected = true;
+        connectFadeFrame = 0; // restart fade-in
         showStatus('Connected', true);
     };
 
@@ -155,13 +160,18 @@ function animate() {
 
     if (particles.length === 0) return;
 
+    // Ramp opacity up from 0 on first connect to avoid the "explosion" of
+    // all particles appearing at once on a fresh black canvas
+    const connectFade = Math.min(connectFadeFrame / CONNECT_FADE_IN_FRAMES, 1.0);
+    if (connectFadeFrame < CONNECT_FADE_IN_FRAMES) connectFadeFrame++;
+
     // Single-pass particle drawing
     ctx.fillStyle = '#fff';
     for (let i = 0; i < particles.length; i++) {
         const p = particles[i];
         if (p.opacity <= MIN_DRAW_OPACITY) continue;
 
-        const opacity = transparentParticles ? p.opacity * TRANSPARENT_OPACITY : p.opacity;
+        const opacity = (transparentParticles ? p.opacity * TRANSPARENT_OPACITY : p.opacity) * connectFade;
         const radius = p.radius;
         if (radius < 0.1) continue;
 

@@ -4,6 +4,7 @@ const canvas = document.getElementById('canvas');
 const ctx = canvas.getContext('2d');
 const statusEl = document.getElementById('status');
 const hintEl = document.getElementById('hint');
+let hintVisible = true;
 
 let width, height;
 
@@ -192,6 +193,13 @@ function animate() {
 // ---- Keyboard ----
 
 window.addEventListener('keydown', (e) => {
+    // Toggle controls hint
+    if (e.key === 'h' || e.key === 'H') {
+        hintVisible = !hintVisible;
+        hintEl.classList.toggle('hidden', !hintVisible);
+        return;
+    }
+
     // Local rendering toggles — handled on client, not forwarded
     if (e.key === 't' || e.key === 'T') {
         transparentParticles = !transparentParticles;

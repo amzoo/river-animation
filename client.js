@@ -368,7 +368,12 @@ function handleClientKey(key) {
     }
     if (key === 'b' || key === 'B') { capillaryDiversion = !capillaryDiversion; updateHint(); }
     if (key === 'm' || key === 'M') { mixSources = !mixSources; updateHint(); }
-    if (key === 'reload') { window.location.reload(); }
+    if (key === 'reload') {
+        ctx.fillStyle = 'black';
+        ctx.fillRect(0, 0, width, height);
+        awaitingReset = true;
+        window.location.reload();
+    }
 }
 
 window.addEventListener('keydown', (e) => {

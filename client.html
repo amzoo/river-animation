@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>River Animation — Client</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { background: black; overflow: hidden; }
+        canvas { display: block; }
+        #status {
+            position: fixed;
+            top: 10px;
+            left: 10px;
+            color: #fff;
+            font: 12px monospace;
+            opacity: 0.7;
+            pointer-events: none;
+            transition: opacity 0.5s;
+            text-shadow: 0 0 4px #000;
+        }
+        #status.hidden { opacity: 0; }
+        #hint {
+            position: fixed;
+            bottom: 10px;
+            left: 10px;
+            color: #555;
+            font: 11px monospace;
+            pointer-events: none;
+        }
+    </style>
+</head>
+<body>
+    <canvas id="canvas"></canvas>
+    <div id="status">Connecting...</div>
+    <div id="hint">T: transparent | C: source colors | B: branching | M: mix | ↑↓: speed</div>
+    <script src="client.js"></script>
+</body>
+</html>

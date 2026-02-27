@@ -1,0 +1,10 @@
+{
+  "name": "river-animation-server",
+  "version": "1.0.0",
+  "description": "Server-side simulation for river animation",
+  "main": "server.js",
+  "dependencies": {
+    "simplex-noise": "2.4.0",
+    "ws": "^8.0.0"
+  }
+}

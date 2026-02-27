@@ -1151,4 +1151,28 @@ function handleMouse(data) {
     }
 }
 
-module.exports = { resize, init, tick, getFrameData, handleKey, handleMouse };
+// Reset simulation state — clears all grids and reinitializes particles
+function reset() {
+    zOff = 0;
+    frameNum = 0;
+    simSpeedAccum = 0;
+    recycledCapillaryCount = 0;
+    wetnessGrid.fill(0);
+    erosionGrid.fill(0);
+    capWetnessGrid.fill(0);
+    capErosionGrid.fill(0);
+    capOwnerGrid.fill(0);
+    capOwnerStr.fill(0);
+    capFadeMask.fill(0);
+    sourceOwnerGrid.fill(-1);
+    riverGrid.fill(0);
+    riverLabels.fill(0);
+    riverCellLastSeen.fill(0);
+    capillaryOrigins = [];
+    prevCapillaryOriginKeys = new Set();
+    particles = [];
+    init();
+    console.log('Simulation reset.');
+}
+
+module.exports = { resize, init, reset, tick, getFrameData, handleKey, handleMouse };

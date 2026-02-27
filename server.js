@@ -29,6 +29,8 @@ wss.on('connection', (ws) => {
 
         if (msg && msg.type === 'key') {
             sim.handleKey(msg.key);
+        } else if (msg && msg.type === 'reset') {
+            sim.reset();
         } else if (msg && msg.type === 'mouse') {
             sim.handleMouse(msg);
         } else if (!msg) {

@@ -202,6 +202,15 @@ window.addEventListener('keydown', (e) => {
         return;
     }
 
+    // Reset simulation
+    if (e.key === '0') {
+        if (ws && ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({ type: 'reset' }));
+            connectFadeFrame = 0; // fade back in after reset
+        }
+        return;
+    }
+
     // All other keys are forwarded to server for simulation control
     if (ws && ws.readyState === WebSocket.OPEN) {
         ws.send(JSON.stringify({ type: 'key', key: e.key }));

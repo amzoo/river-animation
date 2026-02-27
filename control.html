@@ -1,0 +1,180 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>River — Control Panel</title>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body {
+            background: #111;
+            color: #ccc;
+            font: 14px/1.5 monospace;
+            padding: 20px;
+            min-height: 100vh;
+        }
+        h1 { color: #fff; font-size: 16px; margin-bottom: 4px; }
+        #status { font-size: 12px; color: #555; margin-bottom: 24px; }
+        #status.connected { color: #4f4; }
+        #status.disconnected { color: #f44; }
+
+        .group { margin-bottom: 24px; }
+        .group-label {
+            font-size: 11px;
+            text-transform: uppercase;
+            letter-spacing: 0.1em;
+            color: #555;
+            margin-bottom: 10px;
+        }
+        .buttons { display: flex; flex-wrap: wrap; gap: 8px; }
+
+        button {
+            background: #222;
+            border: 1px solid #444;
+            color: #aaa;
+            font: 13px monospace;
+            padding: 10px 16px;
+            border-radius: 4px;
+            cursor: pointer;
+            transition: background 0.1s, color 0.1s, border-color 0.1s;
+            min-width: 80px;
+        }
+        button:hover { background: #2a2a2a; border-color: #666; color: #fff; }
+        button.active {
+            background: #1a3a1a;
+            border-color: #4f4;
+            color: #4f4;
+            font-weight: bold;
+        }
+        button.danger {
+            border-color: #633;
+            color: #f66;
+        }
+        button.danger:hover { background: #2a1a1a; border-color: #f44; color: #f44; }
+        button.action { border-color: #446; color: #88f; }
+        button.action:hover { background: #1a1a2a; border-color: #88f; color: #aaf; }
+    </style>
+</head>
+<body>
+    <h1>River Animation — Control Panel</h1>
+    <div id="status">Connecting…</div>
+
+    <div class="group">
+        <div class="group-label">Simulation</div>
+        <div class="buttons">
+            <button id="btn-B" onclick="toggleKey('B', 'sim')">B — Branching</button>
+            <button id="btn-M" onclick="toggleKey('M', 'sim')" class="active">M — Mix</button>
+        </div>
+    </div>
+
+    <div class="group">
+        <div class="group-label">Speed</div>
+        <div class="buttons">
+            <button class="action" onclick="simKey('ArrowUp')">↑ Faster</button>
+            <button class="action" onclick="simKey('ArrowDown')">↓ Slower</button>
+        </div>
+    </div>
+
+    <div class="group">
+        <div class="group-label">Display (client)</div>
+        <div class="buttons">
+            <button id="btn-T" onclick="toggleKey('T', 'client')">T — Transparent</button>
+            <button id="btn-C" onclick="toggleKey('C', 'client')">C — Colors</button>
+            <button id="btn-W" onclick="toggleKey('W', 'client')">W — Wetness</button>
+            <button id="btn-E" onclick="toggleKey('E', 'client')">E — Erosion</button>
+            <button id="btn-H" onclick="toggleKey('H', 'client')">H — Hide UI</button>
+        </div>
+    </div>
+
+    <div class="group">
+        <div class="group-label">Actions</div>
+        <div class="buttons">
+            <button class="danger" onclick="doReset()">0 — Reset</button>
+            <button class="action" onclick="doReload()">↺ Reload client</button>
+        </div>
+    </div>
+
+    <script>
+        const params = new URLSearchParams(window.location.search);
+        const serverAddr = params.get('server') || (window.location.hostname + ':8080');
+        const wsUrl = `ws://${serverAddr}`;
+
+        const statusEl = document.getElementById('status');
+
+        // Toggle states
+        const state = { B: false, M: true, T: false, C: false, W: false, E: false, H: false };
+
+        let ws = null;
+
+        function connect() {
+            statusEl.textContent = `Connecting to ${wsUrl}…`;
+            statusEl.className = '';
+            ws = new WebSocket(wsUrl);
+
+            ws.onopen = () => {
+                statusEl.textContent = `Connected to ${wsUrl}`;
+                statusEl.className = 'connected';
+            };
+
+            ws.onmessage = (e) => {
+                if (typeof e.data !== 'string') return;
+                const msg = JSON.parse(e.data);
+                // Sync state if another control panel toggled something
+                if (msg.type === 'client_key') syncToggle(msg.key);
+            };
+
+            ws.onclose = () => {
+                statusEl.textContent = 'Disconnected — reconnecting…';
+                statusEl.className = 'disconnected';
+                setTimeout(connect, 2000);
+            };
+
+            ws.onerror = () => ws.close();
+        }
+
+        function send(msg) {
+            if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(msg));
+        }
+
+        // Send a simulation key directly to the server
+        function simKey(key) {
+            send({ type: 'key', key });
+        }
+
+        // Toggle a key and update button state
+        function toggleKey(key, target) {
+            if (target === 'sim') {
+                state[key] = !state[key];
+                send({ type: 'key', key });
+            } else {
+                state[key] = !state[key];
+                send({ type: 'client_key', key });
+                // W/E also need an overlay message to start/stop grid data
+                if (key === 'W') send({ type: 'overlay', grid: 'wetness' });
+                if (key === 'E') send({ type: 'overlay', grid: 'erosion' });
+            }
+            updateButton(key);
+        }
+
+        function syncToggle(key) {
+            const k = key.toUpperCase();
+            if (k in state) { state[k] = !state[k]; updateButton(k); }
+        }
+
+        function updateButton(key) {
+            const btn = document.getElementById('btn-' + key);
+            if (btn) btn.classList.toggle('active', state[key]);
+        }
+
+        function doReset() {
+            send({ type: 'reset' });
+        }
+
+        function doReload() {
+            send({ type: 'client_key', key: 'reload' });
+        }
+
+        connect();
+    </script>
+</body>
+</html>

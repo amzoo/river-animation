@@ -1060,8 +1060,14 @@ function tick() {
     frameNum++;
 }
 
+// All server→client binary messages begin with a type byte:
+//   0x00 = particle frame
+//   0x01 = wetness grid
+//   0x02 = erosion grid
+
 // Pack all visible particle render data into a compact binary Buffer.
-// Header (8 bytes): frameNum (uint32LE) + particleCount (uint32LE)
+// Byte 0: type 0x00
+// Bytes 1-4: frameNum (uint32LE), bytes 5-8: particleCount (uint32LE)
 // Per particle (8 bytes): x (uint16), y (uint16), opacity (uint8 * 255),
 //   radius (uint8 * 10), sourceIdx (uint8), flags (uint8: bit0=isCapillary)
 function getFrameData() {
@@ -1071,11 +1077,12 @@ function getFrameData() {
         if (particles[i].drawOpacity > MIN_DRAW_OPACITY) count++;
     }
 
-    const buf = Buffer.allocUnsafe(8 + count * 8);
-    buf.writeUInt32LE(frameNum, 0);
-    buf.writeUInt32LE(count, 4);
+    const buf = Buffer.allocUnsafe(1 + 8 + count * 8);
+    buf.writeUInt8(0x00, 0);
+    buf.writeUInt32LE(frameNum, 1);
+    buf.writeUInt32LE(count, 5);
 
-    let offset = 8;
+    let offset = 9;
     for (let i = 0; i < particles.length; i++) {
         const p = particles[i];
         if (p.drawOpacity <= MIN_DRAW_OPACITY) continue;
@@ -1114,6 +1121,41 @@ function getFrameData() {
         buf.writeUInt8(p.isCapillary ? 1 : 0, offset++);
     }
 
+    return buf;
+}
+
+// Pack a wetness or erosion grid into a compact binary Buffer.
+// Byte 0: type (0x01=wetness, 0x02=erosion)
+// Bytes 1-2: cols (uint16LE), bytes 3-4: rows (uint16LE)
+// Bytes 5-8: maxVal (float32LE, for display label)
+// Bytes 9+: uint8 per cell (value / maxVal * 255)
+function getWetnessData() {
+    let maxW = 0;
+    for (let i = 0; i < wetnessGrid.length; i++) if (wetnessGrid[i] > maxW) maxW = wetnessGrid[i];
+    if (maxW < 1) maxW = 1;
+    const buf = Buffer.allocUnsafe(9 + cols * rows);
+    buf.writeUInt8(0x01, 0);
+    buf.writeUInt16LE(cols, 1);
+    buf.writeUInt16LE(rows, 3);
+    buf.writeFloatLE(maxW, 5);
+    for (let i = 0; i < cols * rows; i++) {
+        buf.writeUInt8(Math.min(255, Math.round(wetnessGrid[i] / maxW * 255)), 9 + i);
+    }
+    return buf;
+}
+
+function getErosionData() {
+    let maxE = 0;
+    for (let i = 0; i < erosionGrid.length; i++) if (erosionGrid[i] > maxE) maxE = erosionGrid[i];
+    if (maxE < 0.01) maxE = 0.01;
+    const buf = Buffer.allocUnsafe(9 + cols * rows);
+    buf.writeUInt8(0x02, 0);
+    buf.writeUInt16LE(cols, 1);
+    buf.writeUInt16LE(rows, 3);
+    buf.writeFloatLE(maxE, 5);
+    for (let i = 0; i < cols * rows; i++) {
+        buf.writeUInt8(Math.min(255, Math.round(erosionGrid[i] / maxE * 255)), 9 + i);
+    }
     return buf;
 }
 
@@ -1175,4 +1217,4 @@ function reset() {
     console.log('Simulation reset.');
 }
 
-module.exports = { resize, init, reset, tick, getFrameData, handleKey, handleMouse };
+module.exports = { resize, init, reset, tick, getFrameData, getWetnessData, getErosionData, handleKey, handleMouse };

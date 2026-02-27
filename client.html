@@ -7,7 +7,7 @@
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body { background: black; overflow: hidden; }
-        canvas { display: block; }
+        canvas { display: block; position: absolute; top: 0; left: 0; }
         #status {
             position: fixed;
             top: 10px;
@@ -30,12 +30,34 @@
             transition: opacity 0.3s;
         }
         #hint.hidden { opacity: 0; }
+        #fps {
+            position: fixed;
+            bottom: 10px;
+            right: 10px;
+            color: #555;
+            font: 11px monospace;
+            pointer-events: none;
+            transition: opacity 0.3s;
+        }
+        #fps.hidden { opacity: 0; }
+        #hint .key { transition: color 0.15s; }
+        #hint .key.active { color: #fff; font-weight: bold; }
     </style>
 </head>
 <body>
     <canvas id="canvas"></canvas>
+    <canvas id="overlay"></canvas>
     <div id="status">Connecting...</div>
-    <div id="hint">T: transparent | C: source colors | B: branching | M: mix | ↑↓: speed | 0: reset | H: hide</div>
+    <div id="fps">-- fps</div>
+    <div id="hint">
+        <span class="key" id="hint-T">T: transparent</span> |
+        <span class="key" id="hint-C">C: source colors</span> |
+        <span class="key" id="hint-W">W: wetness</span> |
+        <span class="key" id="hint-E">E: erosion</span> |
+        <span class="key" id="hint-B">B: branching</span> |
+        <span class="key" id="hint-M">M: mix</span> |
+        ↑↓: speed | 0: reset | H: hide
+    </div>
     <script src="client.js"></script>
 </body>
 </html>

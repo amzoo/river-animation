@@ -2,15 +2,36 @@
 
 const canvas = document.getElementById('canvas');
 const ctx = canvas.getContext('2d');
+const overlayCanvas = document.getElementById('overlay');
+const overlayCtx = overlayCanvas.getContext('2d');
 const statusEl = document.getElementById('status');
 const hintEl = document.getElementById('hint');
+const fpsEl = document.getElementById('fps');
 let hintVisible = true;
+
+// Track server-side toggle states (mirrored client-side for hint display)
+let capillaryDiversion = false;
+let mixSources = true; // default on in sim-core.js
+
+function setHintActive(id, active) {
+    const el = document.getElementById(id);
+    if (el) el.classList.toggle('active', active);
+}
+
+function updateHint() {
+    setHintActive('hint-T', transparentParticles);
+    setHintActive('hint-C', sourceColorParticles);
+    setHintActive('hint-W', wetnessOverlay);
+    setHintActive('hint-E', erosionOverlay);
+    setHintActive('hint-B', capillaryDiversion);
+    setHintActive('hint-M', mixSources);
+}
 
 let width, height;
 
 function resizeCanvas() {
-    width = canvas.width = window.innerWidth;
-    height = canvas.height = window.innerHeight;
+    width = canvas.width = overlayCanvas.width = window.innerWidth;
+    height = canvas.height = overlayCanvas.height = window.innerHeight;
 }
 resizeCanvas();
 window.addEventListener('resize', resizeCanvas);
@@ -26,6 +47,8 @@ let particles = [];
 // Local rendering toggles
 let transparentParticles = false;
 let sourceColorParticles = false;
+let wetnessOverlay = false;
+let erosionOverlay = false;
 
 // Rendering constants (must match script.js / sim-core.js)
 const MIN_DRAW_OPACITY = 0.0;
@@ -35,6 +58,17 @@ const FADE_SLOW_AMOUNT = 1;
 const FADE_FAST_AMOUNT = 6;
 const TRAIL_BLUR_RADIUS = 0.8;
 const TRAIL_BLUR_ALPHA = 0.5;
+const HEATMAP_WETNESS_ALPHA = 0.5;
+const HEATMAP_EROSION_ALPHA = 0.6;
+const HEATMAP_LOW_BREAK = 0.33;
+const HEATMAP_HIGH_BREAK = 0.66;
+const EROSION_MID_BREAK = 0.5;
+const EROSION_BASE_R = 128;
+const EROSION_RANGE_R = 127;
+const EROSION_BASE_G_HIGH = 165;
+const EROSION_RANGE_G_HIGH = 90;
+const EROSION_BASE_B = 200;
+const OVERLAY_FONT_SIZE = 12;
 
 const RIVER_COLORS = [
     [253, 189, 165],  // Coral
@@ -55,13 +89,22 @@ let statusHideTimer = null;
 // Frame counter for "every other frame" fade logic
 let fadeToggle = false;
 
-// Last received frame number (for FPS tracking)
-let lastFrameNum = 0;
+// FPS tracking
+let smoothFPS = 0;
+let lastFrameTime = performance.now();
+let serverFPS = null;
+let awaitingReset = false;
+
+// Last received frame number
 let frameNum = 0;
 
 // Fade-in after connect: ramp particle opacity from 0→1 over this many RAF frames
 const CONNECT_FADE_IN_FRAMES = 180; // ~3 seconds at 60fps
 let connectFadeFrame = 0;
+
+// Latest grid data received from server
+let wetnessGrid = null; // { cols, rows, maxVal, data: Uint8Array }
+let erosionGrid = null;
 
 function showStatus(msg, autoHide) {
     statusEl.textContent = msg;
@@ -84,9 +127,22 @@ function connect() {
     };
 
     ws.onmessage = (e) => {
-        if (e.data instanceof ArrayBuffer) {
-            unpackFrame(e.data);
+        if (typeof e.data === 'string') {
+            const msg = JSON.parse(e.data);
+            if (msg.type === 'fps') serverFPS = msg.fps;
+            if (msg.type === 'client_key') handleClientKey(msg.key);
+            if (msg.type === 'reset_ack') {
+                awaitingReset = false;
+                particles = [];
+                connectFadeFrame = 0;
+            }
+            return;
         }
+        const view = new DataView(e.data);
+        const type = view.getUint8(0);
+        if (type === 0x00) unpackParticles(view);
+        else if (type === 0x01) unpackGrid(view, 'wetness');
+        else if (type === 0x02) unpackGrid(view, 'erosion');
     };
 
     ws.onclose = () => {
@@ -96,30 +152,25 @@ function connect() {
     };
 
     ws.onerror = () => {
-        // onclose fires after onerror
         ws.close();
     };
 }
 
-// Unpack binary frame from server.
-// Header (8 bytes): frameNum (uint32LE), particleCount (uint32LE)
-// Per particle (8 bytes): x (uint16), y (uint16), opacity (uint8),
-//   radius (uint8, / 10), sourceIdx (uint8), flags (uint8: bit0=isCapillary)
-function unpackFrame(buf) {
-    const view = new DataView(buf);
-    frameNum = view.getUint32(0, true);
-    const count = view.getUint32(4, true);
+// Byte 0: type 0x00
+// Bytes 1-4: frameNum (uint32LE), bytes 5-8: count (uint32LE)
+// Per particle (8 bytes): x, y (uint16), opacity, radius (uint8), sourceIdx, flags (uint8)
+function unpackParticles(view) {
+    frameNum = view.getUint32(1, true);
+    const count = view.getUint32(5, true);
 
-    // Grow or shrink particles array to match
     while (particles.length < count) particles.push({});
     particles.length = count;
 
-    let offset = 8;
+    let offset = 9;
     for (let i = 0; i < count; i++) {
         const p = particles[i];
         const xEnc = view.getUint16(offset, true); offset += 2;
         const yEnc = view.getUint16(offset, true); offset += 2;
-        // Scale normalized coords to current client canvas dimensions
         p.x = xEnc / 65535 * width;
         p.y = yEnc / 65535 * height;
         p.opacity    = view.getUint8(offset++) / 255;
@@ -130,10 +181,90 @@ function unpackFrame(buf) {
     }
 }
 
+// Byte 0: type, bytes 1-2: cols, bytes 3-4: rows, bytes 5-8: maxVal, bytes 9+: uint8 data
+function unpackGrid(view, which) {
+    const cols   = view.getUint16(1, true);
+    const rows   = view.getUint16(3, true);
+    const maxVal = view.getFloat32(5, true);
+    const data   = new Uint8Array(view.buffer, 9, cols * rows);
+    if (which === 'wetness') wetnessGrid = { cols, rows, maxVal, data };
+    else                     erosionGrid  = { cols, rows, maxVal, data };
+}
+
+// ---- Overlay rendering ----
+
+function renderWetness(grid) {
+    const cellW = width  / grid.cols;
+    const cellH = height / grid.rows;
+    overlayCtx.save();
+    for (let r = 0; r < grid.rows; r++) {
+        for (let c = 0; c < grid.cols; c++) {
+            const v = grid.data[r * grid.cols + c];
+            if (v === 0) continue;
+            const t = v / 255;
+            let red, green, blue;
+            if (t < HEATMAP_LOW_BREAK) {
+                const s = t / HEATMAP_LOW_BREAK;
+                red = 0; green = Math.floor(s * 255); blue = 255;
+            } else if (t < HEATMAP_HIGH_BREAK) {
+                const s = (t - HEATMAP_LOW_BREAK) / HEATMAP_LOW_BREAK;
+                red = Math.floor(s * 255); green = 255; blue = Math.floor((1 - s) * 255);
+            } else {
+                const s = (t - HEATMAP_HIGH_BREAK) / (1 - HEATMAP_HIGH_BREAK);
+                red = 255; green = Math.floor((1 - s) * 255); blue = 0;
+            }
+            overlayCtx.fillStyle = `rgba(${red},${green},${blue},${HEATMAP_WETNESS_ALPHA})`;
+            overlayCtx.fillRect(c * cellW, r * cellH, cellW, cellH);
+        }
+    }
+    overlayCtx.font = `${OVERLAY_FONT_SIZE}px monospace`;
+    overlayCtx.fillStyle = '#ffffff';
+    overlayCtx.fillText(`WETNESS (max: ${grid.maxVal.toFixed(1)})`, 8, 16);
+    overlayCtx.restore();
+}
+
+function renderErosion(grid) {
+    const cellW = width  / grid.cols;
+    const cellH = height / grid.rows;
+    overlayCtx.save();
+    for (let r = 0; r < grid.rows; r++) {
+        for (let c = 0; c < grid.cols; c++) {
+            const v = grid.data[r * grid.cols + c];
+            if (v === 0) continue;
+            const t = v / 255;
+            let red, green, blue;
+            if (t < EROSION_MID_BREAK) {
+                const s = t / EROSION_MID_BREAK;
+                red = Math.floor(EROSION_BASE_R + s * EROSION_RANGE_R);
+                green = Math.floor(s * EROSION_BASE_G_HIGH);
+                blue = Math.floor(EROSION_BASE_B * (1 - s));
+            } else {
+                const s = (t - EROSION_MID_BREAK) / EROSION_MID_BREAK;
+                red = 255;
+                green = Math.floor(EROSION_BASE_G_HIGH + s * EROSION_RANGE_G_HIGH);
+                blue = Math.floor(s * 255);
+            }
+            overlayCtx.fillStyle = `rgba(${red},${green},${blue},${HEATMAP_EROSION_ALPHA})`;
+            overlayCtx.fillRect(c * cellW, r * cellH, cellW, cellH);
+        }
+    }
+    overlayCtx.font = `${OVERLAY_FONT_SIZE}px monospace`;
+    overlayCtx.fillStyle = '#ffffff';
+    overlayCtx.fillText(`EROSION (max: ${grid.maxVal.toFixed(1)})`, 8, wetnessOverlay ? 32 : 16);
+    overlayCtx.restore();
+}
+
 // ---- Render loop ----
 
 function animate() {
     requestAnimationFrame(animate);
+
+    const now = performance.now();
+    const dt = now - lastFrameTime;
+    lastFrameTime = now;
+    if (dt > 0) smoothFPS = smoothFPS * 0.95 + (1000 / dt) * 0.05;
+    fpsEl.textContent = `client ${smoothFPS.toFixed(1)} fps` +
+        (serverFPS !== null ? `  |  server ${serverFPS.toFixed(1)} fps` : '');
 
     // Canvas fade — "hold then quickly fade" effect, every other RAF call
     fadeToggle = !fadeToggle;
@@ -151,15 +282,22 @@ function animate() {
         }
         ctx.putImageData(imgData, 0, 0);
 
-        // Subtle blur pass to soften trail edges
-        ctx.save();
-        ctx.filter = `blur(${TRAIL_BLUR_RADIUS}px)`;
-        ctx.globalAlpha = TRAIL_BLUR_ALPHA;
-        ctx.drawImage(canvas, 0, 0);
-        ctx.restore();
+        // Subtle blur pass to soften trail edges — skip during fade-in to prevent bloom
+        if (connectFadeFrame >= CONNECT_FADE_IN_FRAMES) {
+            ctx.save();
+            ctx.filter = `blur(${TRAIL_BLUR_RADIUS}px)`;
+            ctx.globalAlpha = TRAIL_BLUR_ALPHA;
+            ctx.drawImage(canvas, 0, 0);
+            ctx.restore();
+        }
     }
 
-    if (particles.length === 0) return;
+    // Overlay heatmaps
+    overlayCtx.clearRect(0, 0, width, height);
+    if (wetnessOverlay && wetnessGrid) renderWetness(wetnessGrid);
+    if (erosionOverlay  && erosionGrid)  renderErosion(erosionGrid);
+
+    if (awaitingReset || particles.length === 0) return;
 
     // Ramp opacity up from 0 on first connect to avoid the "explosion" of
     // all particles appearing at once on a fresh black canvas
@@ -192,21 +330,51 @@ function animate() {
 
 // ---- Keyboard ----
 
-window.addEventListener('keydown', (e) => {
-    // Toggle controls hint
-    if (e.key === 'h' || e.key === 'H') {
+// Handle client-local keys — called from keyboard events and remote control panel
+function handleClientKey(key) {
+    if (key === 'h' || key === 'H') {
         hintVisible = !hintVisible;
         hintEl.classList.toggle('hidden', !hintVisible);
+        fpsEl.classList.toggle('hidden', !hintVisible);
         return;
     }
-
-    // Local rendering toggles — handled on client, not forwarded
-    if (e.key === 't' || e.key === 'T') {
+    if (key === 't' || key === 'T') {
         transparentParticles = !transparentParticles;
+        updateHint();
         return;
     }
-    if (e.key === 'c' || e.key === 'C') {
+    if (key === 'c' || key === 'C') {
         sourceColorParticles = !sourceColorParticles;
+        updateHint();
+        return;
+    }
+    if (key === 'w' || key === 'W') {
+        wetnessOverlay = !wetnessOverlay;
+        if (!wetnessOverlay) wetnessGrid = null;
+        if (ws && ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({ type: 'overlay', grid: 'wetness' }));
+        }
+        updateHint();
+        return;
+    }
+    if (key === 'e' || key === 'E') {
+        erosionOverlay = !erosionOverlay;
+        if (!erosionOverlay) erosionGrid = null;
+        if (ws && ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({ type: 'overlay', grid: 'erosion' }));
+        }
+        updateHint();
+        return;
+    }
+    if (key === 'b' || key === 'B') { capillaryDiversion = !capillaryDiversion; updateHint(); }
+    if (key === 'm' || key === 'M') { mixSources = !mixSources; updateHint(); }
+    if (key === 'reload') { window.location.reload(); }
+}
+
+window.addEventListener('keydown', (e) => {
+    // Client-local keys
+    if ('hHtTcCwWeE'.includes(e.key)) {
+        handleClientKey(e.key);
         return;
     }
 
@@ -218,11 +386,11 @@ window.addEventListener('keydown', (e) => {
         ctx.fillStyle = 'black';
         ctx.fillRect(0, 0, width, height);
         particles = [];
-        connectFadeFrame = 0;
+        awaitingReset = true;
         return;
     }
 
-    // All other keys are forwarded to server for simulation control
+    // Forward to server for simulation control (server echoes B/M back via client_key)
     if (ws && ws.readyState === WebSocket.OPEN) {
         ws.send(JSON.stringify({ type: 'key', key: e.key }));
     }
@@ -247,3 +415,4 @@ window.addEventListener('keydown', (e) => {
 
 connect();
 animate();
+updateHint();

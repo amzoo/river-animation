@@ -214,8 +214,11 @@ window.addEventListener('keydown', (e) => {
     if (e.key === '0') {
         if (ws && ws.readyState === WebSocket.OPEN) {
             ws.send(JSON.stringify({ type: 'reset' }));
-            connectFadeFrame = 0; // fade back in after reset
         }
+        ctx.fillStyle = 'black';
+        ctx.fillRect(0, 0, width, height);
+        particles = [];
+        connectFadeFrame = 0;
         return;
     }
 

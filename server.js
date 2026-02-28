@@ -1,7 +1,11 @@
 'use strict';
 
 const { WebSocketServer } = require('ws');
+const fs = require('fs');
+const path = require('path');
 const sim = require('./sim-core.js');
+
+const STATE_FILE = path.join(__dirname, 'state.json');
 
 const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 8080;
 const SIM_WIDTH = 1920;
@@ -24,13 +28,38 @@ let erosionOverlay = false;
 let projectorWs = null;
 
 // Tracked display state — synced to new clients on connect
-let currentDisplayTransform = {
+const DEFAULT_TRANSFORM = {
     insetTop: 0, insetBottom: 0, insetLeft: 0, insetRight: 0,
     shiftTop: 0, shiftBottom: 0, shiftLeft: 0, shiftRight: 0,
     fadeTop: 0, fadeBottom: 0, fadeLeft: 0, fadeRight: 0,
 };
 // Lowercase keys only; m starts true to match sim-core default
-const clientToggles = { t: false, c: false, w: false, e: false, h: false, b: false, m: true };
+const DEFAULT_TOGGLES = { t: false, c: false, w: false, e: false, h: false, b: false, m: true };
+
+function loadState() {
+    try {
+        const saved = JSON.parse(fs.readFileSync(STATE_FILE, 'utf8'));
+        return {
+            transform: { ...DEFAULT_TRANSFORM, ...saved.transform },
+            toggles:   { ...DEFAULT_TOGGLES,   ...saved.toggles },
+        };
+    } catch (e) {
+        return { transform: { ...DEFAULT_TRANSFORM }, toggles: { ...DEFAULT_TOGGLES } };
+    }
+}
+
+let saveTimer = null;
+function saveState() {
+    clearTimeout(saveTimer);
+    saveTimer = setTimeout(() => {
+        fs.writeFile(STATE_FILE, JSON.stringify({ transform: currentDisplayTransform, toggles: clientToggles }, null, 2), () => {});
+    }, 500); // debounce — wait 500ms after last change before writing
+}
+
+const { transform: savedTransform, toggles: savedToggles } = loadState();
+let currentDisplayTransform = savedTransform;
+const clientToggles = savedToggles;
+console.log('State loaded from', STATE_FILE);
 
 function sendCurrentState(ws) {
     if (ws.readyState !== ws.OPEN) return;
@@ -69,6 +98,7 @@ wss.on('connection', (ws) => {
             if ('bBmM'.includes(msg.key)) {
                 const k = msg.key.toLowerCase();
                 clientToggles[k] = !clientToggles[k];
+                saveState();
                 const echo = JSON.stringify({ type: 'client_key', key: msg.key });
                 for (const c of clients) {
                     if (c.readyState === c.OPEN) c.send(echo);
@@ -86,7 +116,7 @@ wss.on('connection', (ws) => {
         } else if (msg && msg.type === 'client_key') {
             // Track toggle state
             const k = msg.key.toLowerCase();
-            if (k in clientToggles) clientToggles[k] = !clientToggles[k];
+            if (k in clientToggles) { clientToggles[k] = !clientToggles[k]; saveState(); }
             // Forward to all display clients (all except sender)
             const fwd = JSON.stringify(msg);
             for (const c of clients) {
@@ -103,6 +133,7 @@ wss.on('connection', (ws) => {
         } else if (msg && msg.type === 'display_transform') {
             currentDisplayTransform = { ...currentDisplayTransform, ...msg };
             delete currentDisplayTransform.type;
+            saveState();
             const fwd = JSON.stringify(msg);
             for (const c of clients) {
                 if (c !== ws && c.readyState === c.OPEN) c.send(fwd);

@@ -1,7 +1,7 @@
 'use strict';
 
 const canvas = document.getElementById('canvas');
-const ctx = canvas.getContext('2d');
+const ctx = canvas.getContext('2d', { willReadFrequently: true });
 const overlayCanvas = document.getElementById('overlay');
 const overlayCtx = overlayCanvas.getContext('2d');
 const canvasWrap = document.getElementById('canvas-wrap');
@@ -30,6 +30,8 @@ function updateHint() {
 }
 
 let width, height;
+
+let ws = null;
 
 function resizeCanvas() {
     width = canvas.width = overlayCanvas.width = window.innerWidth;
@@ -88,7 +90,6 @@ const RIVER_COLORS = [
 
 // ---- WebSocket ----
 
-let ws = null;
 let connected = false;
 let statusHideTimer = null;
 
@@ -134,13 +135,27 @@ function applyClientState(s) {
 
 function applyDisplayTransform(t) {
     displayTransform = t;
-    canvasWrap.style.clipPath = `inset(${t.insetTop}% ${t.insetRight}% ${t.insetBottom}% ${t.insetLeft}%)`;
-    canvasWrap.style.transform = `translateX(${t.shiftRight - t.shiftLeft}%) translateY(${t.shiftBottom - t.shiftTop}%)`;
+    canvasWrap.style.clipPath = '';
+    const sx = Math.max(0.01, (100 - t.insetLeft - t.insetRight) / 100);
+    const sy = Math.max(0.01, (100 - t.insetTop - t.insetBottom) / 100);
+    const tx = (t.insetLeft - t.insetRight) / 2 + (t.shiftRight - t.shiftLeft);
+    const ty = (t.insetTop - t.insetBottom) / 2 + (t.shiftBottom - t.shiftTop);
+    canvasWrap.style.transform = `translateX(${tx}%) translateY(${ty}%) scaleX(${sx}) scaleY(${sy})`;
+    // Power-curve fade: stays near-transparent toward content, drops to black quickly at screen edge
+    function fadePow(dir, depth) {
+        const d = depth * 50;
+        return `linear-gradient(${dir}, ` +
+            `black 0%, ` +
+            `rgba(0,0,0,0.85) ${(d * 0.15).toFixed(2)}%, ` +
+            `rgba(0,0,0,0.5)  ${(d * 0.35).toFixed(2)}%, ` +
+            `rgba(0,0,0,0.15) ${(d * 0.65).toFixed(2)}%, ` +
+            `transparent      ${d.toFixed(2)}%)`;
+    }
     const parts = [];
-    if (t.fadeTop    > 0) parts.push(`linear-gradient(to bottom, black, transparent ${t.fadeTop    * 50}%)`);
-    if (t.fadeBottom > 0) parts.push(`linear-gradient(to top,    black, transparent ${t.fadeBottom * 50}%)`);
-    if (t.fadeLeft   > 0) parts.push(`linear-gradient(to right,  black, transparent ${t.fadeLeft   * 50}%)`);
-    if (t.fadeRight  > 0) parts.push(`linear-gradient(to left,   black, transparent ${t.fadeRight  * 50}%)`);
+    if (t.fadeTop    > 0) parts.push(fadePow('to bottom', t.fadeTop));
+    if (t.fadeBottom > 0) parts.push(fadePow('to top',    t.fadeBottom));
+    if (t.fadeLeft   > 0) parts.push(fadePow('to right',  t.fadeLeft));
+    if (t.fadeRight  > 0) parts.push(fadePow('to left',   t.fadeRight));
     vignetteEl.style.background = parts.length > 0 ? parts.join(', ') : 'none';
 }
 

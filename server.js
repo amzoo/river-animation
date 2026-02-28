@@ -20,9 +20,30 @@ let fpsStart = Date.now();
 let wetnessOverlay = false;
 let erosionOverlay = false;
 
+// Projector (primary display) client
+let projectorWs = null;
+
+// Tracked display state — synced to new clients on connect
+let currentDisplayTransform = {
+    insetTop: 0, insetBottom: 0, insetLeft: 0, insetRight: 0,
+    shiftTop: 0, shiftBottom: 0, shiftLeft: 0, shiftRight: 0,
+    fadeTop: 0, fadeBottom: 0, fadeLeft: 0, fadeRight: 0,
+};
+// Lowercase keys only; m starts true to match sim-core default
+const clientToggles = { t: false, c: false, w: false, e: false, h: false, b: false, m: true };
+
+function sendCurrentState(ws) {
+    if (ws.readyState !== ws.OPEN) return;
+    ws.send(JSON.stringify({ type: 'display_transform', ...currentDisplayTransform }));
+    ws.send(JSON.stringify({ type: 'client_state', ...clientToggles }));
+}
+
 wss.on('connection', (ws) => {
     clients.add(ws);
     console.log(`Client connected. Total: ${clients.size}`);
+
+    // Send current display state so new clients are immediately in sync
+    sendCurrentState(ws);
 
     ws.on('message', (data, isBinary) => {
         if (isBinary) return; // ignore binary from client
@@ -30,10 +51,24 @@ wss.on('connection', (ws) => {
         let msg = null;
         try { msg = JSON.parse(str); } catch (e) { /* not JSON */ }
 
-        if (msg && msg.type === 'key') {
+        if (msg && msg.type === 'register') {
+            if (msg.role === 'projector') {
+                if (projectorWs && projectorWs.readyState === projectorWs.OPEN) {
+                    ws.send(JSON.stringify({ type: 'error', reason: 'projector_taken' }));
+                    ws.close();
+                    console.log('Rejected duplicate projector registration.');
+                } else {
+                    projectorWs = ws;
+                    ws.send(JSON.stringify({ type: 'registered', role: 'projector' }));
+                    console.log('Projector client registered.');
+                }
+            }
+        } else if (msg && msg.type === 'key') {
             sim.handleKey(msg.key);
             // Echo toggleable sim keys to all clients so their hint bars stay in sync
             if ('bBmM'.includes(msg.key)) {
+                const k = msg.key.toLowerCase();
+                clientToggles[k] = !clientToggles[k];
                 const echo = JSON.stringify({ type: 'client_key', key: msg.key });
                 for (const c of clients) {
                     if (c.readyState === c.OPEN) c.send(echo);
@@ -49,7 +84,25 @@ wss.on('connection', (ws) => {
             if (msg.grid === 'wetness') wetnessOverlay = !wetnessOverlay;
             if (msg.grid === 'erosion') erosionOverlay = !erosionOverlay;
         } else if (msg && msg.type === 'client_key') {
+            // Track toggle state
+            const k = msg.key.toLowerCase();
+            if (k in clientToggles) clientToggles[k] = !clientToggles[k];
             // Forward to all display clients (all except sender)
+            const fwd = JSON.stringify(msg);
+            for (const c of clients) {
+                if (c !== ws && c.readyState === c.OPEN) c.send(fwd);
+            }
+        } else if (msg && msg.type === 'client_dimensions') {
+            // Only forward dimensions from the registered projector client
+            if (ws === projectorWs) {
+                const fwd = JSON.stringify(msg);
+                for (const c of clients) {
+                    if (c !== ws && c.readyState === c.OPEN) c.send(fwd);
+                }
+            }
+        } else if (msg && msg.type === 'display_transform') {
+            currentDisplayTransform = { ...currentDisplayTransform, ...msg };
+            delete currentDisplayTransform.type;
             const fwd = JSON.stringify(msg);
             for (const c of clients) {
                 if (c !== ws && c.readyState === c.OPEN) c.send(fwd);
@@ -62,6 +115,10 @@ wss.on('connection', (ws) => {
     });
 
     ws.on('close', () => {
+        if (ws === projectorWs) {
+            projectorWs = null;
+            console.log('Projector client disconnected.');
+        }
         clients.delete(ws);
         console.log(`Client disconnected. Total: ${clients.size}`);
     });

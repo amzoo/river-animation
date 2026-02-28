@@ -53,6 +53,12 @@
         button.danger:hover { background: #2a1a1a; border-color: #f44; color: #f44; }
         button.action { border-color: #446; color: #88f; }
         button.action:hover { background: #1a1a2a; border-color: #88f; color: #aaf; }
+
+        .slider-row { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; }
+        .slider-label { min-width: 72px; font-size: 12px; color: #888; }
+        input[type=range] { flex: 1; accent-color: #88f; cursor: pointer; }
+        .slider-val { min-width: 40px; font-size: 12px; color: #aaa; text-align: right; font-variant-numeric: tabular-nums; }
+        #preview { display: block; width: 100%; border: 1px solid #333; border-radius: 4px; margin-bottom: 24px; }
     </style>
 </head>
 <body>
@@ -83,6 +89,87 @@
             <button id="btn-W" onclick="toggleKey('W', 'client')">W — Wetness</button>
             <button id="btn-E" onclick="toggleKey('E', 'client')">E — Erosion</button>
             <button id="btn-H" onclick="toggleKey('H', 'client')">H — Hide UI</button>
+        </div>
+    </div>
+
+    <canvas id="preview" width="640" height="360"></canvas>
+    <div class="buttons" style="margin-bottom: 24px;">
+        <button id="btn-transform-overlay" class="action" onclick="toggleTransformOverlay()">Show Overlay (Client)</button>
+        <button class="action" onclick="refreshTransformOverlay()">↺ Refresh Overlay</button>
+    </div>
+
+    <div class="group">
+        <div class="group-label">Scale / Inset (client)</div>
+        <div class="slider-row">
+            <span class="slider-label">Top</span>
+            <input type="range" id="sl-insetTop" min="0" max="50" step="0.5" value="0" oninput="onTransform('insetTop', parseFloat(this.value))">
+            <span class="slider-val" id="sv-insetTop">0%</span>
+        </div>
+        <div class="slider-row">
+            <span class="slider-label">Bottom</span>
+            <input type="range" id="sl-insetBottom" min="0" max="50" step="0.5" value="0" oninput="onTransform('insetBottom', parseFloat(this.value))">
+            <span class="slider-val" id="sv-insetBottom">0%</span>
+        </div>
+        <div class="slider-row">
+            <span class="slider-label">Left</span>
+            <input type="range" id="sl-insetLeft" min="0" max="50" step="0.5" value="0" oninput="onTransform('insetLeft', parseFloat(this.value))">
+            <span class="slider-val" id="sv-insetLeft">0%</span>
+        </div>
+        <div class="slider-row">
+            <span class="slider-label">Right</span>
+            <input type="range" id="sl-insetRight" min="0" max="50" step="0.5" value="0" oninput="onTransform('insetRight', parseFloat(this.value))">
+            <span class="slider-val" id="sv-insetRight">0%</span>
+        </div>
+    </div>
+
+    <div class="group">
+        <div class="group-label">Position / Shift (client)</div>
+        <div class="slider-row">
+            <span class="slider-label">Top</span>
+            <input type="range" id="sl-shiftTop" min="0" max="50" step="0.5" value="0" oninput="onTransform('shiftTop', parseFloat(this.value))">
+            <span class="slider-val" id="sv-shiftTop">0%</span>
+        </div>
+        <div class="slider-row">
+            <span class="slider-label">Bottom</span>
+            <input type="range" id="sl-shiftBottom" min="0" max="50" step="0.5" value="0" oninput="onTransform('shiftBottom', parseFloat(this.value))">
+            <span class="slider-val" id="sv-shiftBottom">0%</span>
+        </div>
+        <div class="slider-row">
+            <span class="slider-label">Left</span>
+            <input type="range" id="sl-shiftLeft" min="0" max="50" step="0.5" value="0" oninput="onTransform('shiftLeft', parseFloat(this.value))">
+            <span class="slider-val" id="sv-shiftLeft">0%</span>
+        </div>
+        <div class="slider-row">
+            <span class="slider-label">Right</span>
+            <input type="range" id="sl-shiftRight" min="0" max="50" step="0.5" value="0" oninput="onTransform('shiftRight', parseFloat(this.value))">
+            <span class="slider-val" id="sv-shiftRight">0%</span>
+        </div>
+    </div>
+
+    <div class="group">
+        <div class="group-label">Edge Fade (client)</div>
+        <div class="slider-row">
+            <span class="slider-label">Top</span>
+            <input type="range" id="sl-fadeTop" min="0" max="1" step="0.01" value="0" oninput="onTransform('fadeTop', parseFloat(this.value))">
+            <span class="slider-val" id="sv-fadeTop">0%</span>
+        </div>
+        <div class="slider-row">
+            <span class="slider-label">Bottom</span>
+            <input type="range" id="sl-fadeBottom" min="0" max="1" step="0.01" value="0" oninput="onTransform('fadeBottom', parseFloat(this.value))">
+            <span class="slider-val" id="sv-fadeBottom">0%</span>
+        </div>
+        <div class="slider-row">
+            <span class="slider-label">Left</span>
+            <input type="range" id="sl-fadeLeft" min="0" max="1" step="0.01" value="0" oninput="onTransform('fadeLeft', parseFloat(this.value))">
+            <span class="slider-val" id="sv-fadeLeft">0%</span>
+        </div>
+        <div class="slider-row">
+            <span class="slider-label">Right</span>
+            <input type="range" id="sl-fadeRight" min="0" max="1" step="0.01" value="0" oninput="onTransform('fadeRight', parseFloat(this.value))">
+            <span class="slider-val" id="sv-fadeRight">0%</span>
+        </div>
+        <div class="buttons" style="margin-top:8px;">
+            <button class="action" onclick="resetTransform()">↺ Reset transform</button>
         </div>
     </div>
 
@@ -121,6 +208,11 @@
                 const msg = JSON.parse(e.data);
                 // Sync state if another control panel toggled something
                 if (msg.type === 'client_key') syncToggle(msg.key);
+                if (msg.type === 'client_dimensions') {
+                    previewCanvas.width  = msg.width;
+                    previewCanvas.height = msg.height;
+                    drawPreview();
+                }
             };
 
             ws.onclose = () => {
@@ -166,6 +258,16 @@
             if (btn) btn.classList.toggle('active', state[key]);
         }
 
+        let transformOverlayOn = false;
+        function toggleTransformOverlay() {
+            transformOverlayOn = !transformOverlayOn;
+            document.getElementById('btn-transform-overlay').classList.toggle('active', transformOverlayOn);
+            send({ type: 'client_key', key: 'transform_overlay_toggle' });
+        }
+        function refreshTransformOverlay() {
+            send({ type: 'client_key', key: 'transform_overlay_refresh' });
+        }
+
         function doReset() {
             send({ type: 'reset' });
         }
@@ -173,6 +275,126 @@
         function doReload() {
             send({ type: 'client_key', key: 'reload' });
         }
+
+        // Transform state
+        const transform = {
+            insetTop: 0, insetBottom: 0, insetLeft: 0, insetRight: 0,
+            shiftTop: 0, shiftBottom: 0, shiftLeft: 0, shiftRight: 0,
+            fadeTop: 0, fadeBottom: 0, fadeLeft: 0, fadeRight: 0,
+        };
+
+        const previewCanvas = document.getElementById('preview');
+        const pCtx = previewCanvas.getContext('2d');
+
+        function drawPreview() {
+            const PW = previewCanvas.width, PH = previewCanvas.height;
+            const t = transform;
+            pCtx.clearRect(0, 0, PW, PH);
+
+            // Screen background
+            pCtx.fillStyle = '#111';
+            pCtx.fillRect(0, 0, PW, PH);
+
+            // Inset rect (before shift)
+            const ix1 = t.insetLeft   / 100 * PW;
+            const iy1 = t.insetTop    / 100 * PH;
+            const ix2 = PW - t.insetRight  / 100 * PW;
+            const iy2 = PH - t.insetBottom / 100 * PH;
+            const iw = Math.max(0, ix2 - ix1);
+            const ih = Math.max(0, iy2 - iy1);
+
+            // Net shift in pixels
+            const dx = (t.shiftRight - t.shiftLeft) / 100 * PW;
+            const dy = (t.shiftBottom - t.shiftTop) / 100 * PH;
+
+            // Content rect position after shift
+            const rx = ix1 + dx, ry = iy1 + dy;
+
+            // Cropped-out areas (red tint)
+            pCtx.fillStyle = 'rgba(120, 30, 30, 0.5)';
+            if (t.insetTop    > 0) pCtx.fillRect(0, 0, PW, iy1);
+            if (t.insetBottom > 0) pCtx.fillRect(0, iy2, PW, PH - iy2);
+            if (t.insetLeft   > 0) pCtx.fillRect(0, 0, ix1, PH);
+            if (t.insetRight  > 0) pCtx.fillRect(ix2, 0, PW - ix2, PH);
+
+            // Content area (blue-tinted fill)
+            pCtx.fillStyle = 'rgba(40, 50, 80, 0.9)';
+            pCtx.fillRect(rx, ry, iw, ih);
+
+            // Content border
+            pCtx.strokeStyle = '#446';
+            pCtx.lineWidth = 1;
+            pCtx.strokeRect(rx + 0.5, ry + 0.5, iw - 1, ih - 1);
+
+            // Shift arrow (center → shifted center), only if shifted
+            if (dx !== 0 || dy !== 0) {
+                const cx = PW / 2, cy = PH / 2;
+                pCtx.strokeStyle = 'rgba(180,180,80,0.6)';
+                pCtx.lineWidth = 1;
+                pCtx.setLineDash([3, 3]);
+                pCtx.beginPath();
+                pCtx.moveTo(cx, cy);
+                pCtx.lineTo(cx + dx, cy + dy);
+                pCtx.stroke();
+                pCtx.setLineDash([]);
+                pCtx.fillStyle = 'rgba(180,180,80,0.8)';
+                pCtx.beginPath();
+                pCtx.arc(cx + dx, cy + dy, 3, 0, Math.PI * 2);
+                pCtx.fill();
+            }
+
+            // Edge fade gradients (drawn over content area)
+            const fadeEdges = [
+                { v: t.fadeTop,    x: rx, y: ry,           w: iw, h: ih * t.fadeTop    * 0.5, dir: [0,0,0,1] },
+                { v: t.fadeBottom, x: rx, y: ry + ih,       w: iw, h: ih * t.fadeBottom * 0.5, dir: [0,1,0,0] },
+                { v: t.fadeLeft,   x: rx, y: ry,            w: iw * t.fadeLeft   * 0.5, h: ih, dir: [0,0,1,0] },
+                { v: t.fadeRight,  x: rx + iw, y: ry,       w: iw * t.fadeRight  * 0.5, h: ih, dir: [1,0,0,0] },
+            ];
+            for (const e of fadeEdges) {
+                if (e.v <= 0) continue;
+                const gx1 = e.x - e.w * e.dir[0], gy1 = e.y - e.h * e.dir[1];
+                const gx2 = e.x + e.w * e.dir[2], gy2 = e.y + e.h * e.dir[3];
+                const grad = pCtx.createLinearGradient(gx1, gy1, gx2, gy2);
+                grad.addColorStop(0, 'rgba(0,0,0,0.85)');
+                grad.addColorStop(1, 'rgba(0,0,0,0)');
+                pCtx.fillStyle = grad;
+                pCtx.fillRect(
+                    Math.min(gx1, gx2), Math.min(gy1, gy2),
+                    Math.abs(e.w) || iw, Math.abs(e.h) || ih
+                );
+            }
+
+            // Screen border
+            pCtx.strokeStyle = '#444';
+            pCtx.lineWidth = 1;
+            pCtx.strokeRect(0.5, 0.5, PW - 1, PH - 1);
+        }
+
+        function onTransform(key, value) {
+            transform[key] = value;
+            const label = key.startsWith('fade')
+                ? `${Math.round(value * 100)}%`
+                : `${value}%`;
+            document.getElementById('sv-' + key).textContent = label;
+            drawPreview();
+            send({ type: 'display_transform', ...transform });
+        }
+
+        function resetTransform() {
+            const defaults = {
+                insetTop: 0, insetBottom: 0, insetLeft: 0, insetRight: 0,
+                shiftTop: 0, shiftBottom: 0, shiftLeft: 0, shiftRight: 0,
+                fadeTop: 0, fadeBottom: 0, fadeLeft: 0, fadeRight: 0,
+            };
+            Object.assign(transform, defaults);
+            for (const key of Object.keys(defaults)) {
+                const sl = document.getElementById('sl-' + key);
+                if (sl) sl.value = defaults[key];
+                onTransform(key, defaults[key]);
+            }
+        }
+
+        drawPreview();
 
         connect();
     </script>

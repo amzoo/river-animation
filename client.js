@@ -4,6 +4,8 @@ const canvas = document.getElementById('canvas');
 const ctx = canvas.getContext('2d');
 const overlayCanvas = document.getElementById('overlay');
 const overlayCtx = overlayCanvas.getContext('2d');
+const canvasWrap = document.getElementById('canvas-wrap');
+const vignetteEl = document.getElementById('vignette');
 const statusEl = document.getElementById('status');
 const hintEl = document.getElementById('hint');
 const fpsEl = document.getElementById('fps');
@@ -32,14 +34,18 @@ let width, height;
 function resizeCanvas() {
     width = canvas.width = overlayCanvas.width = window.innerWidth;
     height = canvas.height = overlayCanvas.height = window.innerHeight;
+    if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ type: 'client_dimensions', width, height }));
+    }
 }
 resizeCanvas();
 window.addEventListener('resize', resizeCanvas);
 
-// Parse server address from URL param: ?server=192.168.x.x:8080
+// Parse URL params: ?server=192.168.x.x:8080  ?role=projector
 const params = new URLSearchParams(window.location.search);
 const serverAddr = params.get('server') || (window.location.hostname + ':8080');
 const wsUrl = `ws://${serverAddr}`;
+const isProjector = params.get('role') === 'projector';
 
 // Particle render data (unpacked from binary frames)
 let particles = [];
@@ -106,6 +112,38 @@ let connectFadeFrame = 0;
 let wetnessGrid = null; // { cols, rows, maxVal, data: Uint8Array }
 let erosionGrid = null;
 
+let transformOverlayVisible = false;
+
+// Display transform state
+let displayTransform = {
+    insetTop: 0, insetBottom: 0, insetLeft: 0, insetRight: 0,
+    shiftTop: 0, shiftBottom: 0, shiftLeft: 0, shiftRight: 0,
+    fadeTop: 0, fadeBottom: 0, fadeLeft: 0, fadeRight: 0,
+};
+
+function applyClientState(s) {
+    if ('t' in s) transparentParticles  = s.t;
+    if ('c' in s) sourceColorParticles  = s.c;
+    if ('w' in s) { wetnessOverlay = s.w; if (!s.w) wetnessGrid = null; }
+    if ('e' in s) { erosionOverlay = s.e; if (!s.e) erosionGrid  = null; }
+    if ('h' in s) { hintVisible = !s.h; hintEl.classList.toggle('hidden', s.h); fpsEl.classList.toggle('hidden', s.h); }
+    if ('b' in s) capillaryDiversion = s.b;
+    if ('m' in s) mixSources = s.m;
+    updateHint();
+}
+
+function applyDisplayTransform(t) {
+    displayTransform = t;
+    canvasWrap.style.clipPath = `inset(${t.insetTop}% ${t.insetRight}% ${t.insetBottom}% ${t.insetLeft}%)`;
+    canvasWrap.style.transform = `translateX(${t.shiftRight - t.shiftLeft}%) translateY(${t.shiftBottom - t.shiftTop}%)`;
+    const parts = [];
+    if (t.fadeTop    > 0) parts.push(`linear-gradient(to bottom, black, transparent ${t.fadeTop    * 50}%)`);
+    if (t.fadeBottom > 0) parts.push(`linear-gradient(to top,    black, transparent ${t.fadeBottom * 50}%)`);
+    if (t.fadeLeft   > 0) parts.push(`linear-gradient(to right,  black, transparent ${t.fadeLeft   * 50}%)`);
+    if (t.fadeRight  > 0) parts.push(`linear-gradient(to left,   black, transparent ${t.fadeRight  * 50}%)`);
+    vignetteEl.style.background = parts.length > 0 ? parts.join(', ') : 'none';
+}
+
 function showStatus(msg, autoHide) {
     statusEl.textContent = msg;
     statusEl.classList.remove('hidden');
@@ -124,13 +162,22 @@ function connect() {
         connected = true;
         connectFadeFrame = 0; // restart fade-in
         showStatus('Connected', true);
+        if (isProjector) ws.send(JSON.stringify({ type: 'register', role: 'projector' }));
+        ws.send(JSON.stringify({ type: 'client_dimensions', width, height }));
     };
 
     ws.onmessage = (e) => {
         if (typeof e.data === 'string') {
             const msg = JSON.parse(e.data);
+            if (msg.type === 'error' && msg.reason === 'projector_taken') {
+                rejected = true;
+                showStatus('Projector already connected — connection refused.', false);
+                return;
+            }
             if (msg.type === 'fps') serverFPS = msg.fps;
             if (msg.type === 'client_key') handleClientKey(msg.key);
+            if (msg.type === 'display_transform') applyDisplayTransform(msg);
+            if (msg.type === 'client_state') applyClientState(msg);
             if (msg.type === 'reset_ack') {
                 awaitingReset = false;
                 particles = [];
@@ -145,8 +192,10 @@ function connect() {
         else if (type === 0x02) unpackGrid(view, 'erosion');
     };
 
+    let rejected = false;
     ws.onclose = () => {
         connected = false;
+        if (rejected) return; // server refused us, don't retry
         showStatus('Disconnected — reconnecting…');
         setTimeout(connect, 2000);
     };
@@ -189,6 +238,72 @@ function unpackGrid(view, which) {
     const data   = new Uint8Array(view.buffer, 9, cols * rows);
     if (which === 'wetness') wetnessGrid = { cols, rows, maxVal, data };
     else                     erosionGrid  = { cols, rows, maxVal, data };
+}
+
+function renderTransformOverlay() {
+    const t = displayTransform;
+    const W = width, H = height;
+
+    const ix1 = t.insetLeft   / 100 * W;
+    const iy1 = t.insetTop    / 100 * H;
+    const ix2 = W - t.insetRight  / 100 * W;
+    const iy2 = H - t.insetBottom / 100 * H;
+    const iw = Math.max(0, ix2 - ix1);
+    const ih = Math.max(0, iy2 - iy1);
+
+    const dx = (t.shiftRight - t.shiftLeft) / 100 * W;
+    const dy = (t.shiftBottom - t.shiftTop) / 100 * H;
+    const rx = ix1 + dx, ry = iy1 + dy;
+
+    // Cropped areas (red tint)
+    overlayCtx.fillStyle = 'rgba(120, 30, 30, 0.45)';
+    if (t.insetTop    > 0) overlayCtx.fillRect(0, 0, W, iy1);
+    if (t.insetBottom > 0) overlayCtx.fillRect(0, iy2, W, H - iy2);
+    if (t.insetLeft   > 0) overlayCtx.fillRect(0, 0, ix1, H);
+    if (t.insetRight  > 0) overlayCtx.fillRect(ix2, 0, W - ix2, H);
+
+    // Content rect border
+    overlayCtx.strokeStyle = 'rgba(100, 130, 220, 0.85)';
+    overlayCtx.lineWidth = 2;
+    overlayCtx.strokeRect(rx, ry, iw, ih);
+
+    // Shift arrow (center → shifted center)
+    if (dx !== 0 || dy !== 0) {
+        const cx = W / 2, cy = H / 2;
+        overlayCtx.strokeStyle = 'rgba(220, 200, 80, 0.75)';
+        overlayCtx.lineWidth = 1.5;
+        overlayCtx.setLineDash([6, 4]);
+        overlayCtx.beginPath();
+        overlayCtx.moveTo(cx, cy);
+        overlayCtx.lineTo(cx + dx, cy + dy);
+        overlayCtx.stroke();
+        overlayCtx.setLineDash([]);
+        overlayCtx.fillStyle = 'rgba(220, 200, 80, 0.9)';
+        overlayCtx.beginPath();
+        overlayCtx.arc(cx + dx, cy + dy, 5, 0, Math.PI * 2);
+        overlayCtx.fill();
+    }
+
+    // Fade region indicators (blue tint, distinct from actual black fade)
+    const fades = [
+        { v: t.fadeTop,    x: rx,      y: ry,      w: iw,  h: ih * t.fadeTop    * 0.5, gx: [0,0,0,1] },
+        { v: t.fadeBottom, x: rx,      y: ry + ih, w: iw,  h: ih * t.fadeBottom * 0.5, gx: [0,1,0,0] },
+        { v: t.fadeLeft,   x: rx,      y: ry,      w: iw * t.fadeLeft   * 0.5, h: ih, gx: [0,0,1,0] },
+        { v: t.fadeRight,  x: rx + iw, y: ry,      w: iw * t.fadeRight  * 0.5, h: ih, gx: [1,0,0,0] },
+    ];
+    for (const f of fades) {
+        if (f.v <= 0) continue;
+        const x0 = f.x - f.w * f.gx[0], y0 = f.y - f.h * f.gx[1];
+        const x1 = f.x + f.w * f.gx[2], y1 = f.y + f.h * f.gx[3];
+        const grad = overlayCtx.createLinearGradient(x0, y0, x1, y1);
+        grad.addColorStop(0, 'rgba(60,80,180,0.55)');
+        grad.addColorStop(1, 'rgba(60,80,180,0)');
+        overlayCtx.fillStyle = grad;
+        overlayCtx.fillRect(
+            Math.min(x0, x1), Math.min(y0, y1),
+            f.w || iw, f.h || ih
+        );
+    }
 }
 
 // ---- Overlay rendering ----
@@ -292,10 +407,11 @@ function animate() {
         }
     }
 
-    // Overlay heatmaps
+    // Overlay heatmaps + transform guide
     overlayCtx.clearRect(0, 0, width, height);
     if (wetnessOverlay && wetnessGrid) renderWetness(wetnessGrid);
     if (erosionOverlay  && erosionGrid)  renderErosion(erosionGrid);
+    if (transformOverlayVisible) renderTransformOverlay();
 
     if (awaitingReset || particles.length === 0) return;
 
@@ -368,6 +484,8 @@ function handleClientKey(key) {
     }
     if (key === 'b' || key === 'B') { capillaryDiversion = !capillaryDiversion; updateHint(); }
     if (key === 'm' || key === 'M') { mixSources = !mixSources; updateHint(); }
+    if (key === 'transform_overlay_toggle') { transformOverlayVisible = !transformOverlayVisible; return; }
+    if (key === 'transform_overlay_refresh') { /* overlay redraws automatically next frame */ return; }
     if (key === 'reload') {
         ctx.fillStyle = 'black';
         ctx.fillRect(0, 0, width, height);

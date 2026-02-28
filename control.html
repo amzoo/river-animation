@@ -102,22 +102,22 @@
         <div class="group-label">Scale / Inset (client)</div>
         <div class="slider-row">
             <span class="slider-label">Top</span>
-            <input type="range" id="sl-insetTop" min="0" max="50" step="0.5" value="0" oninput="onTransform('insetTop', parseFloat(this.value))">
+            <input type="range" id="sl-insetTop" min="0" max="100" step="0.5" value="0" oninput="onTransform('insetTop', parseFloat(this.value))">
             <span class="slider-val" id="sv-insetTop">0%</span>
         </div>
         <div class="slider-row">
             <span class="slider-label">Bottom</span>
-            <input type="range" id="sl-insetBottom" min="0" max="50" step="0.5" value="0" oninput="onTransform('insetBottom', parseFloat(this.value))">
+            <input type="range" id="sl-insetBottom" min="0" max="100" step="0.5" value="0" oninput="onTransform('insetBottom', parseFloat(this.value))">
             <span class="slider-val" id="sv-insetBottom">0%</span>
         </div>
         <div class="slider-row">
             <span class="slider-label">Left</span>
-            <input type="range" id="sl-insetLeft" min="0" max="50" step="0.5" value="0" oninput="onTransform('insetLeft', parseFloat(this.value))">
+            <input type="range" id="sl-insetLeft" min="0" max="100" step="0.5" value="0" oninput="onTransform('insetLeft', parseFloat(this.value))">
             <span class="slider-val" id="sv-insetLeft">0%</span>
         </div>
         <div class="slider-row">
             <span class="slider-label">Right</span>
-            <input type="range" id="sl-insetRight" min="0" max="50" step="0.5" value="0" oninput="onTransform('insetRight', parseFloat(this.value))">
+            <input type="range" id="sl-insetRight" min="0" max="100" step="0.5" value="0" oninput="onTransform('insetRight', parseFloat(this.value))">
             <span class="slider-val" id="sv-insetRight">0%</span>
         </div>
     </div>
@@ -206,12 +206,33 @@
             ws.onmessage = (e) => {
                 if (typeof e.data !== 'string') return;
                 const msg = JSON.parse(e.data);
-                // Sync state if another control panel toggled something
                 if (msg.type === 'client_key') syncToggle(msg.key);
                 if (msg.type === 'client_dimensions') {
                     previewCanvas.width  = msg.width;
                     previewCanvas.height = msg.height;
                     drawPreview();
+                }
+                if (msg.type === 'display_transform') {
+                    for (const key of Object.keys(transform)) {
+                        if (!(key in msg)) continue;
+                        transform[key] = msg[key];
+                        const sl = document.getElementById('sl-' + key);
+                        if (sl) sl.value = msg[key];
+                        const isFade = key.startsWith('fade');
+                        const label = isFade ? `${Math.round(msg[key] * 100)}%` : `${msg[key]}%`;
+                        const sv = document.getElementById('sv-' + key);
+                        if (sv) sv.textContent = label;
+                    }
+                    drawPreview();
+                }
+                if (msg.type === 'client_state') {
+                    const keyMap = { t: 'T', c: 'C', w: 'W', e: 'E', h: 'H', b: 'B', m: 'M' };
+                    for (const [k, K] of Object.entries(keyMap)) {
+                        if (k in msg) {
+                            state[K] = msg[k];
+                            updateButton(K);
+                        }
+                    }
                 }
             };
 

@@ -81,16 +81,6 @@ const EROSION_RANGE_G_HIGH = 90;
 const EROSION_BASE_B = 200;
 const OVERLAY_FONT_SIZE = 12;
 
-const RIVER_COLORS = [
-    [253, 189, 165],  // Coral
-    [130, 253, 209],  // Mint
-    [32,  128, 208],  // Blue
-    [191, 157, 220],  // Lilac
-    [45,  187, 105],  // Green
-    [160, 216, 255],  // Light Blue
-    [200, 255, 232],  // Light Mint
-];
-
 // ---- WebSocket ----
 
 let connected = false;
@@ -103,6 +93,7 @@ let fadeToggle = false;
 let smoothFPS = 0;
 let lastFrameTime = performance.now();
 let serverFPS = null;
+let fpsReportTimer = 0;
 let awaitingReset = false;
 
 // Last received frame number
@@ -398,6 +389,13 @@ function animate() {
     if (dt > 0) smoothFPS = smoothFPS * 0.95 + (1000 / dt) * 0.05;
     fpsEl.textContent = `client ${smoothFPS.toFixed(1)} fps` +
         (serverFPS !== null ? `  |  server ${serverFPS.toFixed(1)} fps` : '');
+    fpsReportTimer += dt;
+    if (fpsReportTimer >= 1000) {
+        fpsReportTimer = 0;
+        if (ws && ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({ type: 'client_fps', fps: Math.round(smoothFPS * 10) / 10 }));
+        }
+    }
 
     // Canvas fade — "hold then quickly fade" effect, every other RAF call
     fadeToggle = !fadeToggle;

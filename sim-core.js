@@ -1217,4 +1217,6 @@ function reset() {
     console.log('Simulation reset.');
 }
 
-module.exports = { resize, init, reset, tick, getFrameData, getWetnessData, getErosionData, handleKey, handleMouse };
+function getSimSpeed() { return simSpeed; }
+
+module.exports = { resize, init, reset, tick, getFrameData, getWetnessData, getErosionData, handleKey, handleMouse, getSimSpeed };

@@ -65,6 +65,7 @@ function sendCurrentState(ws) {
     if (ws.readyState !== ws.OPEN) return;
     ws.send(JSON.stringify({ type: 'display_transform', ...currentDisplayTransform }));
     ws.send(JSON.stringify({ type: 'client_state', ...clientToggles }));
+    ws.send(JSON.stringify({ type: 'sim_speed', speed: sim.getSimSpeed() }));
 }
 
 wss.on('connection', (ws) => {
@@ -79,7 +80,6 @@ wss.on('connection', (ws) => {
         const str = data.toString();
         let msg = null;
         try { msg = JSON.parse(str); } catch (e) { /* not JSON */ }
-
         if (msg && msg.type === 'register') {
             if (msg.role === 'projector') {
                 if (projectorWs && projectorWs.readyState === projectorWs.OPEN) {
@@ -102,6 +102,13 @@ wss.on('connection', (ws) => {
                 const echo = JSON.stringify({ type: 'client_key', key: msg.key });
                 for (const c of clients) {
                     if (c.readyState === c.OPEN) c.send(echo);
+                }
+            }
+            // Broadcast updated speed after arrow key changes
+            if (msg.key === 'ArrowUp' || msg.key === 'ArrowDown') {
+                const speedMsg = JSON.stringify({ type: 'sim_speed', speed: sim.getSimSpeed() });
+                for (const c of clients) {
+                    if (c.readyState === c.OPEN) c.send(speedMsg);
                 }
             }
         } else if (msg && msg.type === 'reset') {
@@ -134,6 +141,11 @@ wss.on('connection', (ws) => {
             currentDisplayTransform = { ...currentDisplayTransform, ...msg };
             delete currentDisplayTransform.type;
             saveState();
+            const fwd = JSON.stringify(msg);
+            for (const c of clients) {
+                if (c !== ws && c.readyState === c.OPEN) c.send(fwd);
+            }
+        } else if (msg && msg.type === 'client_fps') {
             const fwd = JSON.stringify(msg);
             for (const c of clients) {
                 if (c !== ws && c.readyState === c.OPEN) c.send(fwd);

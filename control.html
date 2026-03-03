@@ -64,6 +64,7 @@
 <body>
     <h1>River Animation — Control Panel</h1>
     <div id="status">Connecting…</div>
+    <div id="fps-display" style="font-size:12px;color:#555;margin-bottom:16px;">server — fps  |  client — fps</div>
 
     <div class="group">
         <div class="group-label">Simulation</div>
@@ -78,6 +79,7 @@
         <div class="buttons">
             <button class="action" onclick="simKey('ArrowUp')">↑ Faster</button>
             <button class="action" onclick="simKey('ArrowDown')">↓ Slower</button>
+            <span id="speed-display" style="display:flex;align-items:center;padding:0 8px;color:#888;font:13px monospace;">—</span>
         </div>
     </div>
 
@@ -181,7 +183,11 @@
         </div>
     </div>
 
+    <script src="constants.js"></script>
     <script>
+        // SIM_WIDTH must match server.js
+        const SIM_WIDTH = 1920;
+
         const params = new URLSearchParams(window.location.search);
         const isSecure = window.location.protocol === 'https:';
         const serverAddr = params.get('server');
@@ -200,6 +206,7 @@
             statusEl.textContent = `Connecting to ${wsUrl}…`;
             statusEl.className = '';
             ws = new WebSocket(wsUrl);
+            ws.binaryType = 'arraybuffer';
 
             ws.onopen = () => {
                 statusEl.textContent = `Connected to ${wsUrl}`;
@@ -207,13 +214,19 @@
             };
 
             ws.onmessage = (e) => {
-                if (typeof e.data !== 'string') return;
+                if (typeof e.data !== 'string') {
+                    const view = new DataView(e.data);
+                    if (view.getUint8(0) === 0x00) unpackPreviewParticles(view);
+                    return;
+                }
                 const msg = JSON.parse(e.data);
+                if (msg.type === 'sim_speed') document.getElementById('speed-display').textContent = msg.speed + 'x';
+                if (msg.type === 'fps') updateFpsDisplay('server', msg.fps);
+                if (msg.type === 'client_fps') updateFpsDisplay('client', msg.fps);
                 if (msg.type === 'client_key') syncToggle(msg.key);
                 if (msg.type === 'client_dimensions') {
                     previewCanvas.width  = msg.width;
                     previewCanvas.height = msg.height;
-                    drawPreview();
                 }
                 if (msg.type === 'display_transform') {
                     for (const key of Object.keys(transform)) {
@@ -226,7 +239,7 @@
                         const sv = document.getElementById('sv-' + key);
                         if (sv) sv.textContent = label;
                     }
-                    drawPreview();
+                    previewDirty = true;
                 }
                 if (msg.type === 'client_state') {
                     const keyMap = { t: 'T', c: 'C', w: 'W', e: 'E', h: 'H', b: 'B', m: 'M' };
@@ -246,6 +259,35 @@
             };
 
             ws.onerror = () => ws.close();
+        }
+
+        const fpsValues = { server: null, client: null };
+        function updateFpsDisplay(which, fps) {
+            fpsValues[which] = fps;
+            const s = fpsValues.server !== null ? `server ${fpsValues.server} fps` : 'server — fps';
+            const c = fpsValues.client !== null ? `client ${fpsValues.client} fps` : 'client — fps';
+            document.getElementById('fps-display').textContent = `${s}  |  ${c}`;
+        }
+
+        // ---- Sim preview ----
+        let previewParticles = [];
+        let previewDirty = true;
+
+        function unpackPreviewParticles(view) {
+            const count = view.getUint32(5, true);
+            while (previewParticles.length < count) previewParticles.push({});
+            previewParticles.length = count;
+            let offset = 9;
+            for (let i = 0; i < count; i++) {
+                const p = previewParticles[i];
+                p.x  = view.getUint16(offset, true) / 65535; offset += 2;
+                p.y  = view.getUint16(offset, true) / 65535; offset += 2;
+                p.opacity   = view.getUint8(offset++) / 255;
+                p.radius    = view.getUint8(offset++) / 10;
+                p.sourceIdx = view.getUint8(offset++);
+                offset++; // flags
+            }
+            previewDirty = true;
         }
 
         function send(msg) {
@@ -316,15 +358,28 @@
             pCtx.clearRect(0, 0, PW, PH);
 
             // Screen background
-            pCtx.fillStyle = '#111';
+            pCtx.fillStyle = '#000';
             pCtx.fillRect(0, 0, PW, PH);
 
-            // Match client CSS transform math exactly:
-            // scaleX/Y from inset, translateX/Y from inset asymmetry + shift
+            // Particles — apply same transform as client CSS (scale around center + translate)
             const sx = Math.max(0.01, (100 - t.insetLeft - t.insetRight) / 100);
             const sy = Math.max(0.01, (100 - t.insetTop - t.insetBottom) / 100);
             const tx = (t.insetLeft - t.insetRight) / 2 + (t.shiftRight - t.shiftLeft);
             const ty = (t.insetTop - t.insetBottom) / 2 + (t.shiftBottom - t.shiftTop);
+            pCtx.save();
+            pCtx.translate(PW / 2 + tx / 100 * PW, PH / 2 + ty / 100 * PH);
+            pCtx.scale(sx, sy);
+            pCtx.translate(-PW / 2, -PH / 2);
+            for (let i = 0; i < previewParticles.length; i++) {
+                const p = previewParticles[i];
+                if (p.opacity <= 0.01) continue;
+                const clr = RIVER_COLORS[p.sourceIdx % RIVER_COLORS.length];
+                const r = Math.max(0.8, p.radius * PW / SIM_WIDTH);
+                pCtx.globalAlpha = p.opacity;
+                pCtx.fillStyle = `rgb(${clr[0]},${clr[1]},${clr[2]})`;
+                pCtx.fillRect(p.x * PW - r, p.y * PH - r, r * 2, r * 2);
+            }
+            pCtx.restore();
 
             // Content rect in preview coordinates (transform origin = center)
             const cw = sx * PW;
@@ -390,7 +445,7 @@
                 ? `${Math.round(value * 100)}%`
                 : `${value}%`;
             document.getElementById('sv-' + key).textContent = label;
-            drawPreview();
+            previewDirty = true;
             send({ type: 'display_transform', ...transform });
         }
 
@@ -408,7 +463,7 @@
             }
         }
 
-        drawPreview();
+        (function loop() { requestAnimationFrame(loop); if (previewDirty) { previewDirty = false; drawPreview(); } })();
 
         connect();
     </script>

@@ -45,8 +45,11 @@ window.addEventListener('resize', resizeCanvas);
 
 // Parse URL params: ?server=192.168.x.x:8080  ?role=projector
 const params = new URLSearchParams(window.location.search);
-const serverAddr = params.get('server') || (window.location.hostname + ':8080');
-const wsUrl = `ws://${serverAddr}`;
+const isSecure = window.location.protocol === 'https:';
+const serverAddr = params.get('server');
+const wsUrl = serverAddr
+    ? `${isSecure ? 'wss' : 'ws'}://${serverAddr}`
+    : `${isSecure ? 'wss' : 'ws'}://${window.location.host}/ws`;
 const isProjector = params.get('role') === 'projector';
 
 // Particle render data (unpacked from binary frames)

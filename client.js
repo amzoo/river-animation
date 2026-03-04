@@ -318,6 +318,11 @@ void main() {
         clearTrail() {
             clearFBO(fboA);
             clearFBO(fboB);
+            // Also clear the screen canvas immediately — FBO clears alone don't
+            // update what's visible until the next blit pass.
+            glCtx.bindFramebuffer(glCtx.FRAMEBUFFER, null);
+            glCtx.clearColor(0, 0, 0, 1);
+            glCtx.clear(glCtx.COLOR_BUFFER_BIT);
         },
 
         render(opts) {
@@ -705,14 +710,19 @@ function animate() {
     if (transformOverlayVisible) renderTransformOverlay();
 
     if (awaitingReset || particles.length === 0) {
-        // Keep canvas black during reset
-        if (!glRenderer && ctx) {
-            if (fadeToggle) {
-                ctx.globalCompositeOperation = 'destination-out';
-                ctx.fillStyle = `rgba(0,0,0,${FADE_FAST_AMOUNT / 255})`;
-                ctx.fillRect(0, 0, width, height);
-                ctx.globalCompositeOperation = 'source-over';
-            }
+        // Keep canvas black while waiting for particles.
+        // WebGL: blit the (cleared) FBO so the screen stays black.
+        // Canvas2D: fill black instantly rather than fading slowly.
+        if (glRenderer) {
+            glRenderer.render({
+                parts: [], fadeThisFrame: false, connectFade: 0,
+                transparent: false, sourceColors: false,
+                dpr: window.devicePixelRatio || 1,
+            });
+        } else if (ctx) {
+            ctx.globalCompositeOperation = 'source-over';
+            ctx.fillStyle = 'black';
+            ctx.fillRect(0, 0, width, height);
         }
         return;
     }

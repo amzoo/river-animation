@@ -35,11 +35,19 @@ function updateHint() {
 
 let width, height;
 let ws = null;
+let glRenderer = null;
 
 function resizeCanvas() {
-    width = canvas.width = overlayCanvas.width = window.innerWidth;
-    height = canvas.height = overlayCanvas.height = window.innerHeight;
-    if (glRenderer) glRenderer.resize(width, height);
+    const dpr = window.devicePixelRatio || 1;
+    width = window.innerWidth;
+    height = window.innerHeight;
+    canvas.width = overlayCanvas.width = Math.round(width * dpr);
+    canvas.height = overlayCanvas.height = Math.round(height * dpr);
+    canvas.style.width = overlayCanvas.style.width = width + 'px';
+    canvas.style.height = overlayCanvas.style.height = height + 'px';
+    overlayCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    if (ctx) ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    if (glRenderer) glRenderer.resize(Math.round(width * dpr), Math.round(height * dpr));
     if (ws && ws.readyState === WebSocket.OPEN) {
         ws.send(JSON.stringify({ type: 'client_dimensions', width, height }));
     }
@@ -107,8 +115,6 @@ let displayTransform = {
 // ============================================================
 // Unit 6: WebGL2 FBO renderer
 // ============================================================
-
-let glRenderer = null;
 
 function initWebGL(glCtx) {
     // ---------- shader sources ----------
@@ -478,6 +484,7 @@ function connect() {
     ws.onopen = () => {
         connected = true;
         connectFadeFrame = 0;
+        useZstd = false;
         showStatus('Connected', true);
         if (isProjector) ws.send(JSON.stringify({ type: 'register', role: 'projector' }));
         ws.send(JSON.stringify({ type: 'client_dimensions', width, height }));

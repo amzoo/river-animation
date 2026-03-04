@@ -12,6 +12,8 @@ const path                 = require('path');
 
 const { SIM_WIDTH, TARGET_FPS, GRID_SEND_EVERY } = require('./shared-state.js');
 
+const USE_ZSTD = typeof zlib.zstdCompressSync === 'function';
+
 const STATE_FILE = path.join(__dirname, 'state.json');
 const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 8080;
 
@@ -77,11 +79,8 @@ worker.on('message', (msg) => {
     if (clients.size === 0) return;
     if (msg.type === 'frame') fpsFrameCount++;
     if (msg.type === 'frame' || msg.type === 'grid') {
-        // Compress with Zstd level-1 (Node 22+ native) before broadcast
         const raw = Buffer.from(msg.buf);
-        broadcastBinary(zlib.zstdCompressSync
-            ? zlib.zstdCompressSync(raw, { level: 1 })
-            : raw); // fallback: send uncompressed if Zstd unavailable
+        broadcastBinary(USE_ZSTD ? zlib.zstdCompressSync(raw, { level: 1 }) : raw);
     }
 });
 
@@ -125,8 +124,8 @@ function sendCurrentState(ws) {
     ws.send(JSON.stringify({ type: 'display_transform', ...currentDisplayTransform }));
     ws.send(JSON.stringify({ type: 'client_state', ...clientToggles }));
     ws.send(JSON.stringify({ type: 'sim_speed', speed: simSpeed }));
-    // Signal Zstd capability so client can enable decompression
-    ws.send(JSON.stringify({ type: 'encoding', compression: 'zstd' }));
+    // Signal Zstd only if server is actually compressing
+    if (USE_ZSTD) ws.send(JSON.stringify({ type: 'encoding', compression: 'zstd' }));
 }
 
 wss.on('connection', (ws) => {

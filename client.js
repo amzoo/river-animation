@@ -124,7 +124,8 @@ precision mediump float;
 in vec2 a_pos;
 void main() { gl_Position = vec4(a_pos, 0.0, 1.0); }`;
 
-    // "Hold bright, fade dim" — matches Canvas2D getImageData logic exactly.
+    // "Hold bright, fade dim" + blur matching Canvas2D: drawImage(blur 0.8px, alpha 0.5)
+    // Original: result = 0.5 * sharp + 0.5 * blurred  (centre keeps 62.5% weight)
     const FADE_FRAG = `#version 300 es
 precision mediump float;
 uniform sampler2D u_trail;
@@ -135,8 +136,22 @@ uniform float u_fastFade;
 out vec4 outColor;
 void main() {
     vec2 uv = gl_FragCoord.xy / u_resolution;
-    vec4 c = texture(u_trail, uv);
-    float v = c.r; // brightness (white-on-black; for source colors same logic on R)
+    vec2 px = 1.0 / u_resolution;
+    vec4 sharp = texture(u_trail, uv);
+    // 3×3 weighted blur (Gaussian-ish kernel, sums to 1)
+    vec4 blurred =
+        texture(u_trail, uv + px * vec2(-1,-1)) * 0.0625 +
+        texture(u_trail, uv + px * vec2( 0,-1)) * 0.125  +
+        texture(u_trail, uv + px * vec2( 1,-1)) * 0.0625 +
+        texture(u_trail, uv + px * vec2(-1, 0)) * 0.125  +
+        sharp                                   * 0.25   +
+        texture(u_trail, uv + px * vec2( 1, 0)) * 0.125  +
+        texture(u_trail, uv + px * vec2(-1, 1)) * 0.0625 +
+        texture(u_trail, uv + px * vec2( 0, 1)) * 0.125  +
+        texture(u_trail, uv + px * vec2( 1, 1)) * 0.0625;
+    // Match Canvas2D drawImage(blur, alpha=0.5): blend 50% sharp + 50% blurred
+    vec4 c = sharp * 0.5 + blurred * 0.5;
+    float v = c.r;
     float fadeAmt = v > u_holdThreshold ? u_slowFade : u_fastFade;
     float newV = max(0.0, v - fadeAmt);
     // For source-color mode keep hue; scale by brightness ratio
@@ -233,8 +248,8 @@ void main() {
         const tex = glCtx.createTexture();
         glCtx.bindTexture(glCtx.TEXTURE_2D, tex);
         glCtx.texImage2D(glCtx.TEXTURE_2D, 0, glCtx.RGBA8, w, h, 0, glCtx.RGBA, glCtx.UNSIGNED_BYTE, null);
-        glCtx.texParameteri(glCtx.TEXTURE_2D, glCtx.TEXTURE_MIN_FILTER, glCtx.NEAREST);
-        glCtx.texParameteri(glCtx.TEXTURE_2D, glCtx.TEXTURE_MAG_FILTER, glCtx.NEAREST);
+        glCtx.texParameteri(glCtx.TEXTURE_2D, glCtx.TEXTURE_MIN_FILTER, glCtx.LINEAR);
+        glCtx.texParameteri(glCtx.TEXTURE_2D, glCtx.TEXTURE_MAG_FILTER, glCtx.LINEAR);
         glCtx.texParameteri(glCtx.TEXTURE_2D, glCtx.TEXTURE_WRAP_S, glCtx.CLAMP_TO_EDGE);
         glCtx.texParameteri(glCtx.TEXTURE_2D, glCtx.TEXTURE_WRAP_T, glCtx.CLAMP_TO_EDGE);
         const fbo = glCtx.createFramebuffer();

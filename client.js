@@ -101,7 +101,8 @@ let statusHideTimer = null;
 let fadeToggle = false;
 let smoothFPS = 0;
 let lastFrameTime = performance.now();
-let lastParticleFrameTime = performance.now();
+let particleFrameCount = 0;
+let particleFpsWindowStart = performance.now();
 let serverFPS = null;
 let fpsReportTimer = 0;
 let awaitingReset = false;
@@ -554,10 +555,14 @@ function connect() {
         const view = new DataView(rawBuf);
         const type = view.getUint8(0);
         if (type === 0x00) {
+            particleFrameCount++;
             const now = performance.now();
-            const pdt = now - lastParticleFrameTime;
-            lastParticleFrameTime = now;
-            if (pdt > 0) smoothFPS = smoothFPS * 0.95 + (1000 / pdt) * 0.05;
+            const elapsed = now - particleFpsWindowStart;
+            if (elapsed >= 500) {
+                smoothFPS = particleFrameCount / (elapsed / 1000);
+                particleFrameCount = 0;
+                particleFpsWindowStart = now;
+            }
             unpackParticles(view);
         }
         else if (type === 0x01) unpackGrid(view, 'wetness');

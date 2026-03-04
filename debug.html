@@ -1,0 +1,478 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>River — Debug</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { background: black; overflow: hidden; }
+        canvas { display: block; position: absolute; top: 0; left: 0; }
+        #status {
+            position: fixed; top: 10px; left: 10px;
+            color: #fff; font: 12px monospace;
+            opacity: 0.7; pointer-events: none;
+            text-shadow: 0 0 4px #000;
+        }
+        #info {
+            position: fixed; bottom: 10px; left: 10px;
+            color: #555; font: 11px monospace; pointer-events: none;
+        }
+        #fps {
+            position: fixed; top: 10px; right: 10px;
+            color: #555; font: 12px monospace; pointer-events: none;
+            text-shadow: 0 0 4px #000;
+        }
+    </style>
+</head>
+<body>
+    <canvas id="canvas"></canvas>
+    <canvas id="overlay"></canvas>
+    <div id="status">Connecting…</div>
+    <div id="fps">-- fps</div>
+    <div id="info">Left click: push arc | Middle click: particle burst | Scroll/[]: sample size (R mode)<br>D: debug | E: erosion | W: wetness | P: stats | C: colors | T: transparent | B: branching | M: mix | ↑↓: speed</div>
+    <script src="fzstd.js"></script>
+    <script src="constants.js"></script>
+    <script>
+'use strict';
+
+const canvas     = document.getElementById('canvas');
+const ctx        = canvas.getContext('2d');
+const overlay    = document.getElementById('overlay');
+const overlayCtx = overlay.getContext('2d');
+const statusEl   = document.getElementById('status');
+const fpsEl      = document.getElementById('fps');
+
+const dpr = window.devicePixelRatio || 1;
+let width, height;
+
+function resize() {
+    width = window.innerWidth;
+    height = window.innerHeight;
+    canvas.width  = overlay.width  = Math.round(width  * dpr);
+    canvas.height = overlay.height = Math.round(height * dpr);
+    canvas.style.width  = overlay.style.width  = width  + 'px';
+    canvas.style.height = overlay.style.height = height + 'px';
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    overlayCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
+}
+resize();
+window.addEventListener('resize', resize);
+
+// ---- Zone constants — must match sim-core.js ----
+const CONVERGENCE_RAMP_RATIO = 0.10;
+const DELTA_ZONE_END         = 0.30;
+const TRANSITION_ZONE_END    = 0.40;
+
+// ---- Mouse push arc constants — must match sim-core.js ----
+const PUSH_ARC_RADIUS_NORM  = 300 / 1920;
+const PUSH_ARC_SPAN         = 1.0;
+const PUSH_PILL_RADIUS_NORM = 10 / 1920;
+
+// ---- Heatmap constants — must match script.js ----
+const HEATMAP_LOW_BREAK      = 0.33;
+const HEATMAP_HIGH_BREAK     = 0.66;
+const HEATMAP_WETNESS_ALPHA  = 0.5;
+const HEATMAP_EROSION_ALPHA  = 0.6;
+const EROSION_MID_BREAK      = 0.5;
+const EROSION_BASE_R         = 128;
+const EROSION_RANGE_R        = 127;
+const EROSION_BASE_G_HIGH    = 165;
+const EROSION_RANGE_G_HIGH   = 90;
+const EROSION_BASE_B         = 200;
+
+// ---- Layout constants ----
+const OVERLAY_FONT_SIZE      = 12;
+const STATS_LINE_HEIGHT      = 16;
+const PARTICLE_STATS_PANEL_W = 420;
+const STATS_PANEL_PADDING    = 16;
+const OVERLAY_DASH_PATTERN   = [8, 6];
+const PUSH_ARC_DASH          = [4, 4];
+const HELP_BAR_HEIGHT        = 50;
+
+// ---- State ----
+let debugOverlay         = false;
+let wetnessOverlay       = false;
+let erosionOverlay       = false;
+let particleStatsOverlay = false;
+let transparentParticles = false;
+let sourceColors         = false;
+let capillaryDiversion   = false;
+let mixSources           = true;
+let simSpeed             = 1;
+let serverFPS            = 0;
+let smoothClientFPS      = 60;
+let lastFrameTime        = performance.now();
+
+let wetnessGrid = null;
+let erosionGrid = null;
+let particles   = [];
+
+// ---- Mouse debug tracking ----
+let clientPushAngle   = 0;
+let clientMouseX      = 0, clientMouseY = 0;
+let clientMouseActive = false, clientMouseDown = false;
+let prevMouseX = 0, prevMouseY = 0, mouseLeftDown = false;
+
+// ---- WebSocket ----
+const params     = new URLSearchParams(window.location.search);
+const isSecure   = window.location.protocol === 'https:';
+const serverAddr = params.get('server');
+const wsUrl      = serverAddr
+    ? `${isSecure ? 'wss' : 'ws'}://${serverAddr}`
+    : `${isSecure ? 'wss' : 'ws'}://${window.location.host}/ws`;
+
+let ws      = null;
+let useZstd = false;
+
+// ---- Overlay rendering ----
+
+function renderDebugOverlay() {
+    overlayCtx.save();
+    overlayCtx.setLineDash(OVERLAY_DASH_PATTERN);
+    overlayCtx.lineWidth = 1;
+    overlayCtx.font = `${OVERLAY_FONT_SIZE}px monospace`;
+    overlayCtx.textBaseline = 'top';
+
+    const regions = [
+        { y: 0,                               label: 'Spawn boundary (y=0)',                                    color: '#ff4444' },
+        { y: height * CONVERGENCE_RAMP_RATIO, label: `Convergence ramp end (${CONVERGENCE_RAMP_RATIO * 100}%)`, color: '#ffaa00' },
+        { y: height * DELTA_ZONE_END,         label: `Delta zone end (${DELTA_ZONE_END * 100}%)`,               color: '#44ff44' },
+        { y: height * TRANSITION_ZONE_END,    label: `Transition zone end (${TRANSITION_ZONE_END * 100}%)`,     color: '#4488ff' },
+    ];
+    for (const r of regions) {
+        overlayCtx.strokeStyle = r.color;
+        overlayCtx.fillStyle   = r.color;
+        overlayCtx.beginPath();
+        overlayCtx.moveTo(0, r.y);
+        overlayCtx.lineTo(width, r.y);
+        overlayCtx.stroke();
+        overlayCtx.fillText(r.label, 8, r.y + 4);
+    }
+
+    // Mouse push arc
+    if (clientMouseActive) {
+        const arcR  = PUSH_ARC_RADIUS_NORM  * width;
+        const pillR = PUSH_PILL_RADIUS_NORM * width;
+        const angle = clientPushAngle;
+        const dirX  = Math.cos(angle), dirY = Math.sin(angle);
+        const acx   = clientMouseX - dirX * arcR;
+        const acy   = clientMouseY - dirY * arcR;
+        const half  = PUSH_ARC_SPAN * 0.5;
+        const startA = angle - half, endA = angle + half;
+
+        overlayCtx.setLineDash(clientMouseDown ? [] : PUSH_ARC_DASH);
+        overlayCtx.strokeStyle = clientMouseDown ? 'rgba(255,100,100,0.9)' : 'rgba(255,100,100,0.6)';
+        overlayCtx.lineWidth = 1;
+        overlayCtx.beginPath();
+        overlayCtx.arc(acx, acy, arcR + pillR, startA, endA);
+        const capEx = acx + arcR * Math.cos(endA), capEy = acy + arcR * Math.sin(endA);
+        overlayCtx.arc(capEx, capEy, pillR, endA, endA + Math.PI);
+        overlayCtx.arc(acx, acy, arcR - pillR, endA, startA, true);
+        const capSx = acx + arcR * Math.cos(startA), capSy = acy + arcR * Math.sin(startA);
+        overlayCtx.arc(capSx, capSy, pillR, startA + Math.PI, startA);
+        overlayCtx.closePath();
+        overlayCtx.stroke();
+        overlayCtx.fillStyle = 'rgba(255,100,100,0.05)';
+        overlayCtx.fill();
+        overlayCtx.setLineDash([]);
+        overlayCtx.fillStyle = '#ff6464';
+        overlayCtx.fillText('Push arc', clientMouseX + 12, clientMouseY - 14);
+    }
+
+    overlayCtx.restore();
+}
+
+function renderWetness() {
+    if (!wetnessGrid) return;
+    const { cols, rows, maxVal, data } = wetnessGrid;
+    const cellW = width  / cols;
+    const cellH = height / rows;
+    overlayCtx.save();
+    for (let r = 0; r < rows; r++) {
+        for (let c = 0; c < cols; c++) {
+            const v = data[r * cols + c];
+            if (v === 0) continue;
+            const t = v / 255;
+            let red, green, blue;
+            if (t < HEATMAP_LOW_BREAK) {
+                const s = t / HEATMAP_LOW_BREAK;
+                red = 0; green = Math.floor(s * 255); blue = 255;
+            } else if (t < HEATMAP_HIGH_BREAK) {
+                const s = (t - HEATMAP_LOW_BREAK) / HEATMAP_LOW_BREAK;
+                red = Math.floor(s * 255); green = 255; blue = Math.floor((1 - s) * 255);
+            } else {
+                const s = (t - HEATMAP_HIGH_BREAK) / (1 - HEATMAP_HIGH_BREAK);
+                red = 255; green = Math.floor((1 - s) * 255); blue = 0;
+            }
+            overlayCtx.fillStyle = `rgba(${red},${green},${blue},${HEATMAP_WETNESS_ALPHA})`;
+            overlayCtx.fillRect(c * cellW, r * cellH, cellW, cellH);
+        }
+    }
+    overlayCtx.font = `${OVERLAY_FONT_SIZE}px monospace`;
+    overlayCtx.fillStyle = '#ffffff';
+    overlayCtx.textBaseline = 'top';
+    overlayCtx.fillText(`WETNESS (max: ${maxVal.toFixed(1)})`, 8, 16);
+    overlayCtx.restore();
+}
+
+function renderErosion() {
+    if (!erosionGrid) return;
+    const { cols, rows, maxVal, data } = erosionGrid;
+    const cellW = width  / cols;
+    const cellH = height / rows;
+    overlayCtx.save();
+    for (let r = 0; r < rows; r++) {
+        for (let c = 0; c < cols; c++) {
+            const v = data[r * cols + c];
+            if (v === 0) continue;
+            const t = v / 255;
+            let red, green, blue;
+            if (t < EROSION_MID_BREAK) {
+                const s = t / EROSION_MID_BREAK;
+                red   = Math.floor(EROSION_BASE_R + s * EROSION_RANGE_R);
+                green = Math.floor(s * EROSION_BASE_G_HIGH);
+                blue  = Math.floor(EROSION_BASE_B * (1 - s));
+            } else {
+                const s = (t - EROSION_MID_BREAK) / EROSION_MID_BREAK;
+                red   = 255;
+                green = Math.floor(EROSION_BASE_G_HIGH + s * EROSION_RANGE_G_HIGH);
+                blue  = Math.floor(s * 255);
+            }
+            overlayCtx.fillStyle = `rgba(${red},${green},${blue},${HEATMAP_EROSION_ALPHA})`;
+            overlayCtx.fillRect(c * cellW, r * cellH, cellW, cellH);
+        }
+    }
+    overlayCtx.font = `${OVERLAY_FONT_SIZE}px monospace`;
+    overlayCtx.fillStyle = '#ffffff';
+    overlayCtx.textBaseline = 'top';
+    overlayCtx.fillText(`EROSION (max: ${maxVal.toFixed(1)})`, 8, wetnessOverlay ? 32 : 16);
+    overlayCtx.restore();
+}
+
+function renderParticleStats() {
+    const total = particles.length;
+    let river = 0, capillary = 0;
+    let onCanvas = 0, aboveCanvas = 0, belowCanvas = 0;
+    let inDeltaCount = 0, inTransCount = 0, inRiverCount = 0;
+    const deltaEnd = height * DELTA_ZONE_END;
+    const transEnd = height * TRANSITION_ZONE_END;
+
+    for (const p of particles) {
+        if (p.x >= 0 && p.x <= width && p.y >= 0 && p.y <= height) {
+            onCanvas++;
+        } else {
+            if (p.y < 0) aboveCanvas++;
+            else if (p.y > height) belowCanvas++;
+        }
+        if (p.isCapillary) { capillary++; } else { river++; }
+        if      (p.y < 0)        { /* above */ }
+        else if (p.y < deltaEnd) inDeltaCount++;
+        else if (p.y < transEnd) inTransCount++;
+        else if (p.y <= height)  inRiverCount++;
+    }
+
+    const lines = [
+        `PARTICLE STATS (P to hide)`,
+        ``,
+        `Total: ${total}`,
+        `River: ${river}`,
+        `Capillary: ${capillary}  Branch: ${capillaryDiversion ? 'ON' : 'OFF'} (B)  Mix: ${mixSources ? 'ON' : 'OFF'} (M)`,
+        ``,
+        `CANVAS`,
+        `  On:    ${onCanvas}`,
+        `  Above: ${aboveCanvas}`,
+        `  Below: ${belowCanvas}`,
+        ``,
+        `REGIONS`,
+        `  Delta (0-${(DELTA_ZONE_END*100).toFixed(0)}%):       ${inDeltaCount}`,
+        `  Transition (${(DELTA_ZONE_END*100).toFixed(0)}-${(TRANSITION_ZONE_END*100).toFixed(0)}%): ${inTransCount}`,
+        `  River (${(TRANSITION_ZONE_END*100).toFixed(0)}-100%):     ${inRiverCount}`,
+        ``,
+        `Server FPS: ${serverFPS.toFixed(1)}  Client FPS: ${smoothClientFPS.toFixed(1)}  Speed: ${simSpeed}x`,
+    ];
+
+    const lineH  = STATS_LINE_HEIGHT;
+    const panelW = PARTICLE_STATS_PANEL_W;
+    const panelH = lines.length * lineH + STATS_PANEL_PADDING;
+    const panelX = width - panelW - 8;
+    overlayCtx.save();
+    overlayCtx.fillStyle = 'rgba(0,0,0,0.85)';
+    overlayCtx.fillRect(panelX, 8, panelW, panelH);
+    overlayCtx.strokeStyle = '#00ff88';
+    overlayCtx.lineWidth = 1;
+    overlayCtx.strokeRect(panelX, 8, panelW, panelH);
+    overlayCtx.font = `${OVERLAY_FONT_SIZE}px monospace`;
+    overlayCtx.fillStyle = '#00ff88';
+    overlayCtx.textBaseline = 'top';
+    for (let i = 0; i < lines.length; i++) {
+        overlayCtx.fillText(lines[i], panelX + 8, 24 + i * lineH);
+    }
+    overlayCtx.restore();
+}
+
+function renderOverlays() {
+    overlayCtx.clearRect(0, 0, width, height);
+    if (wetnessOverlay)        renderWetness();
+    if (erosionOverlay)        renderErosion();
+    if (debugOverlay)          renderDebugOverlay();
+    if (particleStatsOverlay)  renderParticleStats();
+}
+
+// ---- Particle draw ----
+
+function draw() {
+    const now = performance.now();
+    const dt  = now - lastFrameTime;
+    lastFrameTime = now;
+    smoothClientFPS += (1000 / dt - smoothClientFPS) * 0.1;
+    fpsEl.textContent = `client: ${smoothClientFPS.toFixed(1)} fps | server: ${serverFPS.toFixed(1)} fps`;
+
+    ctx.clearRect(0, 0, width, height);
+    for (let i = 0; i < particles.length; i++) {
+        const p = particles[i];
+        if (p.opacity < 0.01) continue;
+        if (sourceColors) {
+            const c = RIVER_COLORS[p.sourceIdx % RIVER_COLORS.length];
+            ctx.fillStyle = `rgb(${c[0]},${c[1]},${c[2]})`;
+        } else {
+            ctx.fillStyle = '#fff';
+        }
+        ctx.globalAlpha = transparentParticles ? p.opacity * 0.1 : p.opacity;
+        const d = Math.max(1, p.radius * 2);
+        ctx.fillRect(p.x - p.radius, p.y - p.radius, d, d);
+    }
+    ctx.globalAlpha = 1;
+    renderOverlays();
+}
+
+// ---- Unpack ----
+
+function unpackParticles(view) {
+    const count = view.getUint32(5, true);
+    while (particles.length < count) particles.push({});
+    particles.length = count;
+    let offset = 9;
+    for (let i = 0; i < count; i++) {
+        const p = particles[i];
+        p.x           = view.getUint16(offset, true) / 65535 * width;  offset += 2;
+        p.y           = view.getUint16(offset, true) / 65535 * height; offset += 2;
+        p.opacity     = view.getUint8(offset++) / 255;
+        p.radius      = view.getUint8(offset++) / 10;
+        p.sourceIdx   = view.getUint8(offset++);
+        const flags   = view.getUint8(offset++);
+        p.isCapillary = (flags & 1) !== 0;
+    }
+}
+
+function unpackGrid(view, which) {
+    const cols   = view.getUint16(1, true);
+    const rows   = view.getUint16(3, true);
+    const maxVal = view.getFloat32(5, true);
+    const data   = new Uint8Array(view.buffer.slice(9, 9 + cols * rows));
+    if (which === 'wetness') wetnessGrid = { cols, rows, maxVal, data };
+    else                     erosionGrid  = { cols, rows, maxVal, data };
+}
+
+// ---- Mouse forwarding ----
+
+overlay.addEventListener('mousemove', (e) => {
+    const dx = (e.clientX - prevMouseX) / width;
+    const dy = (e.clientY - prevMouseY) / height;
+    prevMouseX = e.clientX; prevMouseY = e.clientY;
+    clientMouseX = e.clientX; clientMouseY = e.clientY; clientMouseActive = true;
+    if (dx !== 0 || dy !== 0) {
+        const target = Math.atan2(dy, dx);
+        let diff = target - clientPushAngle;
+        while (diff >  Math.PI) diff -= Math.PI * 2;
+        while (diff < -Math.PI) diff += Math.PI * 2;
+        clientPushAngle += diff * 0.3;
+    }
+    if (ws && ws.readyState === WebSocket.OPEN)
+        ws.send(JSON.stringify({ type: 'mouse', x: e.clientX / width, y: e.clientY / height, dx, dy, leftDown: mouseLeftDown }));
+});
+overlay.addEventListener('mousedown', (e) => { if (e.button === 0) { mouseLeftDown = true; clientMouseDown = true; } });
+overlay.addEventListener('mouseup',   (e) => { if (e.button === 0) { mouseLeftDown = false; clientMouseDown = false; } });
+
+// ---- Key handling ----
+
+function sendKey(key) {
+    if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'key', key }));
+}
+
+function toggleGridOverlay(grid) {
+    if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'overlay', grid }));
+}
+
+window.addEventListener('keydown', (e) => {
+    switch (e.key.toLowerCase()) {
+        case 'd': debugOverlay         = !debugOverlay;                       break;
+        case 'w': wetnessOverlay       = !wetnessOverlay; toggleGridOverlay('wetness'); break;
+        case 'e': erosionOverlay       = !erosionOverlay; toggleGridOverlay('erosion'); break;
+        case 'p': particleStatsOverlay = !particleStatsOverlay;               break;
+        case 'c': sourceColors         = !sourceColors;                       break;
+        case 't': transparentParticles = !transparentParticles;               break;
+        case 'b': capillaryDiversion   = !capillaryDiversion; sendKey('b');   break;
+        case 'm': mixSources           = !mixSources;         sendKey('m');   break;
+        case 'arrowup':   sendKey('ArrowUp');   break;
+        case 'arrowdown': sendKey('ArrowDown'); break;
+        case '0':
+            if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'reset' }));
+            break;
+    }
+});
+
+// ---- WebSocket ----
+
+function connect() {
+    statusEl.textContent = `Connecting to ${wsUrl}…`;
+    ws = new WebSocket(wsUrl);
+    ws.binaryType = 'arraybuffer';
+
+    ws.onopen = () => {
+        useZstd = false;
+        statusEl.textContent = 'Connected';
+        ws.send(JSON.stringify({ type: 'register', role: 'preview' }));
+        // Re-request active grid overlays on reconnect
+        if (wetnessOverlay) toggleGridOverlay('wetness');
+        if (erosionOverlay) toggleGridOverlay('erosion');
+    };
+
+    ws.onmessage = (e) => {
+        if (typeof e.data === 'string') {
+            const msg = JSON.parse(e.data);
+            if (msg.type === 'encoding' && msg.compression === 'zstd')
+                useZstd = typeof window.fzstd !== 'undefined';
+            if (msg.type === 'client_state') {
+                sourceColors       = !!msg.c;
+                capillaryDiversion = !!msg.b;
+                mixSources         = msg.m !== undefined ? !!msg.m : true;
+            }
+            if (msg.type === 'sim_speed') simSpeed = msg.speed;
+            if (msg.type === 'fps') { serverFPS = msg.fps; fpsEl.textContent = `client: ${smoothClientFPS.toFixed(1)} fps | server: ${serverFPS.toFixed(1)} fps`; }
+            return;
+        }
+        let raw = e.data;
+        if (useZstd) {
+            try { raw = window.fzstd.decompress(new Uint8Array(raw)).buffer; }
+            catch (err) { return; }
+        }
+        const view = new DataView(raw);
+        const type = view.getUint8(0);
+        if      (type === 0x00) { unpackParticles(view); draw(); }
+        else if (type === 0x01) { unpackGrid(view, 'wetness'); }
+        else if (type === 0x02) { unpackGrid(view, 'erosion'); }
+    };
+
+    ws.onclose = () => {
+        ws = null;
+        statusEl.textContent = 'Disconnected — reconnecting…';
+        setTimeout(connect, 2000);
+    };
+    ws.onerror = () => ws.close();
+}
+
+connect();
+    </script>
+</body>
+</html>

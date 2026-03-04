@@ -68,6 +68,9 @@ let transparentParticles = false;
 let sourceColorParticles = false;
 let wetnessOverlay = false;
 let erosionOverlay = false;
+let debugMouse = false;
+let clientPushAngle = 0;
+let clientMouseX = 0, clientMouseY = 0, clientMouseActive = false, clientMouseDown = false;
 
 const MIN_DRAW_OPACITY = 0.0;
 const TRANSPARENT_OPACITY = 0.1;
@@ -75,6 +78,11 @@ const FADE_HOLD_THRESHOLD = 190;
 const FADE_SLOW_AMOUNT = 1;
 const FADE_FAST_AMOUNT = 6;
 const TRAIL_BLUR_RADIUS = 0.8;
+const PARTICLE_RENDER_SCALE = 4.0;
+// Mouse push arc constants (must match sim-core.js)
+const PUSH_ARC_RADIUS_NORM = 300 / 1920; // normalized to sim width
+const PUSH_ARC_SPAN        = 1.0;
+const PUSH_PILL_RADIUS_NORM = 10 / 1920;
 const TRAIL_BLUR_ALPHA = 0.5;
 const HEATMAP_WETNESS_ALPHA = 0.5;
 const HEATMAP_EROSION_ALPHA = 0.6;
@@ -93,6 +101,7 @@ let statusHideTimer = null;
 let fadeToggle = false;
 let smoothFPS = 0;
 let lastFrameTime = performance.now();
+let lastParticleFrameTime = performance.now();
 let serverFPS = null;
 let fpsReportTimer = 0;
 let awaitingReset = false;
@@ -391,7 +400,7 @@ void main() {
                 const radius = p.radius;
                 if (radius < 0.1) continue;
                 const opacity = (transparent ? p.opacity * TRANSPARENT_OPACITY : p.opacity) * connectFade;
-                const size = radius * 2 * dpr;
+                const size = radius * 2 * dpr * PARTICLE_RENDER_SCALE;
                 const clr  = sourceColors ? RIVER_COLORS[p.sourceIdx % RIVER_COLORS.length] : null;
                 const r = clr ? clr[0] / 255 : 1;
                 const g = clr ? clr[1] / 255 : 1;
@@ -544,7 +553,13 @@ function connect() {
 
         const view = new DataView(rawBuf);
         const type = view.getUint8(0);
-        if (type === 0x00) unpackParticles(view);
+        if (type === 0x00) {
+            const now = performance.now();
+            const pdt = now - lastParticleFrameTime;
+            lastParticleFrameTime = now;
+            if (pdt > 0) smoothFPS = smoothFPS * 0.95 + (1000 / pdt) * 0.05;
+            unpackParticles(view);
+        }
         else if (type === 0x01) unpackGrid(view, 'wetness');
         else if (type === 0x02) unpackGrid(view, 'erosion');
     };
@@ -643,6 +658,39 @@ function renderTransformOverlay() {
     }
 }
 
+function renderMouseDebug() {
+    if (!clientMouseActive) return;
+    const arcR  = PUSH_ARC_RADIUS_NORM  * width;
+    const pillR = PUSH_PILL_RADIUS_NORM * width;
+    const angle = clientPushAngle;
+    const dirX  = Math.cos(angle), dirY = Math.sin(angle);
+    const acx   = clientMouseX - dirX * arcR;
+    const acy   = clientMouseY - dirY * arcR;
+    const half  = PUSH_ARC_SPAN * 0.5;
+    const startA = angle - half, endA = angle + half;
+
+    overlayCtx.save();
+    overlayCtx.setLineDash(clientMouseDown ? [] : [6, 4]);
+    overlayCtx.strokeStyle = clientMouseDown ? 'rgba(255,100,100,0.9)' : 'rgba(255,100,100,0.6)';
+    overlayCtx.lineWidth = 1.5;
+    overlayCtx.beginPath();
+    overlayCtx.arc(acx, acy, arcR + pillR, startA, endA);
+    const capEx = acx + arcR * Math.cos(endA), capEy = acy + arcR * Math.sin(endA);
+    overlayCtx.arc(capEx, capEy, pillR, endA, endA + Math.PI);
+    overlayCtx.arc(acx, acy, arcR - pillR, endA, startA, true);
+    const capSx = acx + arcR * Math.cos(startA), capSy = acy + arcR * Math.sin(startA);
+    overlayCtx.arc(capSx, capSy, pillR, startA + Math.PI, startA);
+    overlayCtx.closePath();
+    overlayCtx.stroke();
+    overlayCtx.fillStyle = 'rgba(255,100,100,0.07)';
+    overlayCtx.fill();
+    overlayCtx.setLineDash([]);
+    overlayCtx.fillStyle = 'rgba(255,100,100,0.9)';
+    overlayCtx.font = '12px monospace';
+    overlayCtx.fillText('push arc', clientMouseX + 12, clientMouseY - 12);
+    overlayCtx.restore();
+}
+
 function renderWetness(grid) {
     const cellW = width  / grid.cols;
     const cellH = height / grid.rows;
@@ -712,7 +760,6 @@ function animate() {
     const now = performance.now();
     const dt = now - lastFrameTime;
     lastFrameTime = now;
-    if (dt > 0) smoothFPS = smoothFPS * 0.95 + (1000 / dt) * 0.05;
     fpsEl.textContent = `client ${smoothFPS.toFixed(1)} fps` +
         (serverFPS !== null ? `  |  server ${serverFPS.toFixed(1)} fps` : '');
     fpsReportTimer += dt;
@@ -730,6 +777,7 @@ function animate() {
     if (wetnessOverlay && wetnessGrid) renderWetness(wetnessGrid);
     if (erosionOverlay  && erosionGrid)  renderErosion(erosionGrid);
     if (transformOverlayVisible) renderTransformOverlay();
+    if (debugMouse) renderMouseDebug();
 
     if (awaitingReset || particles.length === 0) {
         // Keep canvas black while waiting for particles.
@@ -799,8 +847,9 @@ function animate() {
                 ctx.fillStyle = '#fff';
             }
             ctx.globalAlpha = opacity;
-            const d = radius * 2;
-            ctx.fillRect(p.x - radius, p.y - radius, d, d);
+            const scaledRadius = radius * PARTICLE_RENDER_SCALE;
+            const d = scaledRadius * 2;
+            ctx.fillRect(p.x - scaledRadius, p.y - scaledRadius, d, d);
         }
         ctx.globalAlpha = 1.0;
     }
@@ -815,6 +864,7 @@ function handleClientKey(key) {
         fpsEl.classList.toggle('hidden', !hintVisible);
         return;
     }
+    if (key === 'd' || key === 'D') { debugMouse = !debugMouse; return; }
     if (key === 't' || key === 'T') { transparentParticles = !transparentParticles; updateHint(); return; }
     if (key === 'c' || key === 'C') { sourceColorParticles = !sourceColorParticles; updateHint(); return; }
     if (key === 'w' || key === 'W') {
@@ -846,7 +896,7 @@ function handleClientKey(key) {
 }
 
 window.addEventListener('keydown', (e) => {
-    if ('hHtTcCwWeE'.includes(e.key)) { handleClientKey(e.key); return; }
+    if ('hHtTcCwWeEdD'.includes(e.key)) { handleClientKey(e.key); return; }
     if (e.key === '0') {
         if (ws && ws.readyState === WebSocket.OPEN)
             ws.send(JSON.stringify({ type: 'reset' }));
@@ -860,20 +910,27 @@ window.addEventListener('keydown', (e) => {
         ws.send(JSON.stringify({ type: 'key', key: e.key }));
 });
 
-// ---- Mouse forwarding (optional) ----
-// Uncomment to enable physics interaction from client mouse:
-//
-// let prevMouseX = 0, prevMouseY = 0, mouseLeftDown = false;
-// canvas.addEventListener('mousemove', (e) => {
-//     const dx = (e.clientX - prevMouseX) / width;
-//     const dy = (e.clientY - prevMouseY) / height;
-//     prevMouseX = e.clientX; prevMouseY = e.clientY;
-//     if (ws && ws.readyState === WebSocket.OPEN) {
-//         ws.send(JSON.stringify({ type: 'mouse', x: e.clientX / width, y: e.clientY / height, dx, dy, leftDown: mouseLeftDown }));
-//     }
-// });
-// canvas.addEventListener('mousedown', (e) => { if (e.button === 0) mouseLeftDown = true; });
-// canvas.addEventListener('mouseup',   (e) => { if (e.button === 0) mouseLeftDown = false; });
+// ---- Mouse forwarding ----
+let prevMouseX = 0, prevMouseY = 0, mouseLeftDown = false;
+overlayCanvas.addEventListener('mousemove', (e) => {
+    const dx = (e.clientX - prevMouseX) / width;
+    const dy = (e.clientY - prevMouseY) / height;
+    prevMouseX = e.clientX; prevMouseY = e.clientY;
+    // Update local debug state
+    clientMouseX = e.clientX; clientMouseY = e.clientY; clientMouseActive = true;
+    if (dx !== 0 || dy !== 0) {
+        const target = Math.atan2(dy, dx);
+        let diff = target - clientPushAngle;
+        while (diff >  Math.PI) diff -= Math.PI * 2;
+        while (diff < -Math.PI) diff += Math.PI * 2;
+        clientPushAngle += diff * 0.3;
+    }
+    if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ type: 'mouse', x: e.clientX / width, y: e.clientY / height, dx, dy, leftDown: mouseLeftDown }));
+    }
+});
+overlayCanvas.addEventListener('mousedown', (e) => { if (e.button === 0) { mouseLeftDown = true; clientMouseDown = true; } });
+overlayCanvas.addEventListener('mouseup',   (e) => { if (e.button === 0) { mouseLeftDown = false; clientMouseDown = false; } });
 
 // ---- Start ----
 

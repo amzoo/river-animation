@@ -15,6 +15,10 @@
         }
         h1 { color: #fff; font-size: 16px; margin-bottom: 4px; }
         #status { font-size: 12px; color: #555; margin-bottom: 24px; }
+        #fps-display {
+            position: fixed; top: 10px; right: 16px;
+            font-size: 12px; color: #555; pointer-events: none;
+        }
         #status.connected { color: #4f4; }
         #status.disconnected { color: #f44; }
 
@@ -64,7 +68,7 @@
 <body>
     <h1>River Animation — Control Panel</h1>
     <div id="status">Connecting…</div>
-    <div id="fps-display" style="font-size:12px;color:#555;margin-bottom:16px;">server — fps  |  client — fps</div>
+    <div id="fps-display">client — fps  |  server — fps</div>
 
     <div class="group">
         <div class="group-label">Simulation</div>
@@ -277,9 +281,9 @@
         const fpsValues = { server: null, client: null };
         function updateFpsDisplay(which, fps) {
             fpsValues[which] = fps;
-            const s = fpsValues.server !== null ? `server ${fpsValues.server} fps` : 'server — fps';
             const c = fpsValues.client !== null ? `client ${fpsValues.client} fps` : 'client — fps';
-            document.getElementById('fps-display').textContent = `${s}  |  ${c}`;
+            const s = fpsValues.server !== null ? `server ${fpsValues.server} fps` : 'server — fps';
+            document.getElementById('fps-display').textContent = `${c}  |  ${s}`;
         }
 
         // ---- Sim preview ----

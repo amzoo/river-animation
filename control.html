@@ -183,6 +183,8 @@
         </div>
     </div>
 
+    <!-- Unit 3: Zstd decompression for compressed binary frames from server -->
+    <script src="https://cdn.jsdelivr.net/npm/fzstd@0.3.2/umd/fzstd.js"></script>
     <script src="constants.js"></script>
     <script>
         // SIM_WIDTH must match server.js
@@ -213,13 +215,24 @@
                 statusEl.className = 'connected';
             };
 
+            // Unit 3: Zstd decompression — set true once server sends encoding message
+            let useZstd = false;
+
             ws.onmessage = (e) => {
                 if (typeof e.data !== 'string') {
-                    const view = new DataView(e.data);
+                    let rawBuf = e.data;
+                    if (useZstd) {
+                        try { rawBuf = window.fzstd.decompress(new Uint8Array(e.data)).buffer; }
+                        catch (_) { rawBuf = e.data; }
+                    }
+                    const view = new DataView(rawBuf);
                     if (view.getUint8(0) === 0x00) unpackPreviewParticles(view);
                     return;
                 }
                 const msg = JSON.parse(e.data);
+                if (msg.type === 'encoding' && msg.compression === 'zstd') {
+                    useZstd = typeof window.fzstd !== 'undefined';
+                }
                 if (msg.type === 'sim_speed') document.getElementById('speed-display').textContent = msg.speed + 'x';
                 if (msg.type === 'fps') updateFpsDisplay('server', msg.fps);
                 if (msg.type === 'client_fps') updateFpsDisplay('client', msg.fps);

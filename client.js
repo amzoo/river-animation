@@ -1,7 +1,12 @@
 'use strict';
 
 const canvas = document.getElementById('canvas');
-const ctx = canvas.getContext('2d', { willReadFrequently: true });
+
+// Unit 6: Try WebGL2 first for the main rendering canvas.
+// Unit 1: If WebGL2 unavailable, fall back to Canvas2D with destination-out fade.
+const gl  = canvas.getContext('webgl2', { alpha: false, antialias: false, depth: false });
+const ctx = gl ? null : canvas.getContext('2d');
+
 const overlayCanvas = document.getElementById('overlay');
 const overlayCtx = overlayCanvas.getContext('2d');
 const canvasWrap = document.getElementById('canvas-wrap');
@@ -11,9 +16,8 @@ const hintEl = document.getElementById('hint');
 const fpsEl = document.getElementById('fps');
 let hintVisible = true;
 
-// Track server-side toggle states (mirrored client-side for hint display)
 let capillaryDiversion = false;
-let mixSources = true; // default on in sim-core.js
+let mixSources = true;
 
 function setHintActive(id, active) {
     const el = document.getElementById(id);
@@ -30,12 +34,12 @@ function updateHint() {
 }
 
 let width, height;
-
 let ws = null;
 
 function resizeCanvas() {
     width = canvas.width = overlayCanvas.width = window.innerWidth;
     height = canvas.height = overlayCanvas.height = window.innerHeight;
+    if (glRenderer) glRenderer.resize(width, height);
     if (ws && ws.readyState === WebSocket.OPEN) {
         ws.send(JSON.stringify({ type: 'client_dimensions', width, height }));
     }
@@ -43,7 +47,6 @@ function resizeCanvas() {
 resizeCanvas();
 window.addEventListener('resize', resizeCanvas);
 
-// Parse URL params: ?server=192.168.x.x:8080  ?role=projector
 const params = new URLSearchParams(window.location.search);
 const isSecure = window.location.protocol === 'https:';
 const serverAddr = params.get('server');
@@ -52,16 +55,12 @@ const wsUrl = serverAddr
     : `${isSecure ? 'wss' : 'ws'}://${window.location.host}/ws`;
 const isProjector = params.get('role') === 'projector';
 
-// Particle render data (unpacked from binary frames)
 let particles = [];
-
-// Local rendering toggles
 let transparentParticles = false;
 let sourceColorParticles = false;
 let wetnessOverlay = false;
 let erosionOverlay = false;
 
-// Rendering constants (must match script.js / sim-core.js)
 const MIN_DRAW_OPACITY = 0.0;
 const TRANSPARENT_OPACITY = 0.1;
 const FADE_HOLD_THRESHOLD = 190;
@@ -81,40 +80,345 @@ const EROSION_RANGE_G_HIGH = 90;
 const EROSION_BASE_B = 200;
 const OVERLAY_FONT_SIZE = 12;
 
-// ---- WebSocket ----
-
 let connected = false;
 let statusHideTimer = null;
-
-// Frame counter for "every other frame" fade logic
 let fadeToggle = false;
-
-// FPS tracking
 let smoothFPS = 0;
 let lastFrameTime = performance.now();
 let serverFPS = null;
 let fpsReportTimer = 0;
 let awaitingReset = false;
-
-// Last received frame number
 let frameNum = 0;
-
-// Fade-in after connect: ramp particle opacity from 0→1 over this many RAF frames
-const CONNECT_FADE_IN_FRAMES = 180; // ~3 seconds at 60fps
+const CONNECT_FADE_IN_FRAMES = 180;
 let connectFadeFrame = 0;
-
-// Latest grid data received from server
-let wetnessGrid = null; // { cols, rows, maxVal, data: Uint8Array }
+let wetnessGrid = null;
 let erosionGrid = null;
-
 let transformOverlayVisible = false;
 
-// Display transform state
+// Unit 3: Zstd decompression flag — set when server signals 'encoding: zstd'
+let useZstd = false;
+
 let displayTransform = {
     insetTop: 0, insetBottom: 0, insetLeft: 0, insetRight: 0,
     shiftTop: 0, shiftBottom: 0, shiftLeft: 0, shiftRight: 0,
     fadeTop: 0, fadeBottom: 0, fadeLeft: 0, fadeRight: 0,
 };
+
+// ============================================================
+// Unit 6: WebGL2 FBO renderer
+// ============================================================
+
+let glRenderer = null;
+
+function initWebGL(glCtx) {
+    // ---------- shader sources ----------
+
+    const FADE_VERT = `#version 300 es
+precision mediump float;
+in vec2 a_pos;
+void main() { gl_Position = vec4(a_pos, 0.0, 1.0); }`;
+
+    // "Hold bright, fade dim" — matches Canvas2D getImageData logic exactly.
+    const FADE_FRAG = `#version 300 es
+precision mediump float;
+uniform sampler2D u_trail;
+uniform vec2 u_resolution;
+uniform float u_holdThreshold; // normalised 0-1
+uniform float u_slowFade;      // per-frame subtract amount
+uniform float u_fastFade;
+out vec4 outColor;
+void main() {
+    vec2 uv = gl_FragCoord.xy / u_resolution;
+    vec4 c = texture(u_trail, uv);
+    float v = c.r; // brightness (white-on-black; for source colors same logic on R)
+    float fadeAmt = v > u_holdThreshold ? u_slowFade : u_fastFade;
+    float newV = max(0.0, v - fadeAmt);
+    // For source-color mode keep hue; scale by brightness ratio
+    float ratio = v > 0.0001 ? newV / v : 0.0;
+    outColor = vec4(c.rgb * ratio, 1.0);
+}`;
+
+    const PARTICLE_VERT = `#version 300 es
+precision mediump float;
+in vec2  a_pos;     // NDC [-1, 1]
+in float a_size;    // diameter in CSS pixels
+in float a_opacity;
+in vec3  a_color;
+out float v_opacity;
+out vec3  v_color;
+void main() {
+    gl_Position  = vec4(a_pos, 0.0, 1.0);
+    gl_PointSize = a_size;
+    v_opacity = a_opacity;
+    v_color   = a_color;
+}`;
+
+    const PARTICLE_FRAG = `#version 300 es
+precision mediump float;
+in float v_opacity;
+in vec3  v_color;
+out vec4 outColor;
+void main() {
+    outColor = vec4(v_color * v_opacity, v_opacity);
+}`;
+
+    const BLIT_VERT = FADE_VERT;
+
+    const BLIT_FRAG = `#version 300 es
+precision mediump float;
+uniform sampler2D u_trail;
+uniform vec2 u_resolution;
+out vec4 outColor;
+void main() {
+    vec2 uv = gl_FragCoord.xy / u_resolution;
+    outColor = texture(u_trail, uv);
+}`;
+
+    function compileShader(type, src) {
+        const s = glCtx.createShader(type);
+        glCtx.shaderSource(s, src);
+        glCtx.compileShader(s);
+        if (!glCtx.getShaderParameter(s, glCtx.COMPILE_STATUS)) {
+            console.error('Shader compile error:', glCtx.getShaderInfoLog(s));
+            return null;
+        }
+        return s;
+    }
+
+    function linkProgram(vsSrc, fsSrc) {
+        const vs = compileShader(glCtx.VERTEX_SHADER, vsSrc);
+        const fs = compileShader(glCtx.FRAGMENT_SHADER, fsSrc);
+        if (!vs || !fs) return null;
+        const p = glCtx.createProgram();
+        glCtx.attachShader(p, vs);
+        glCtx.attachShader(p, fs);
+        glCtx.linkProgram(p);
+        if (!glCtx.getProgramParameter(p, glCtx.LINK_STATUS)) {
+            console.error('Program link error:', glCtx.getProgramInfoLog(p));
+            return null;
+        }
+        return p;
+    }
+
+    const fadeProg     = linkProgram(FADE_VERT,     FADE_FRAG);
+    const particleProg = linkProgram(PARTICLE_VERT, PARTICLE_FRAG);
+    const blitProg     = linkProgram(BLIT_VERT,     BLIT_FRAG);
+    if (!fadeProg || !particleProg || !blitProg) return null;
+
+    // ---------- fullscreen quad ----------
+    const quadBuf = glCtx.createBuffer();
+    glCtx.bindBuffer(glCtx.ARRAY_BUFFER, quadBuf);
+    glCtx.bufferData(glCtx.ARRAY_BUFFER, new Float32Array([
+        -1, -1,  1, -1,  -1, 1,
+         1, -1,  1,  1,  -1, 1,
+    ]), glCtx.STATIC_DRAW);
+
+    // ---------- particle buffer (dynamic, re-uploaded each frame) ----------
+    // Layout per particle: [x_ndc, y_ndc, size, opacity, r, g, b]  = 7 floats
+    const MAX_PARTICLES = 35000;
+    const PARTICLE_FLOATS = 7;
+    const particleBuf = glCtx.createBuffer();
+    glCtx.bindBuffer(glCtx.ARRAY_BUFFER, particleBuf);
+    glCtx.bufferData(glCtx.ARRAY_BUFFER, MAX_PARTICLES * PARTICLE_FLOATS * 4, glCtx.DYNAMIC_DRAW);
+    const particleData = new Float32Array(MAX_PARTICLES * PARTICLE_FLOATS);
+
+    // ---------- FBO helpers ----------
+    function makeFBO(w, h) {
+        const tex = glCtx.createTexture();
+        glCtx.bindTexture(glCtx.TEXTURE_2D, tex);
+        glCtx.texImage2D(glCtx.TEXTURE_2D, 0, glCtx.RGBA8, w, h, 0, glCtx.RGBA, glCtx.UNSIGNED_BYTE, null);
+        glCtx.texParameteri(glCtx.TEXTURE_2D, glCtx.TEXTURE_MIN_FILTER, glCtx.NEAREST);
+        glCtx.texParameteri(glCtx.TEXTURE_2D, glCtx.TEXTURE_MAG_FILTER, glCtx.NEAREST);
+        glCtx.texParameteri(glCtx.TEXTURE_2D, glCtx.TEXTURE_WRAP_S, glCtx.CLAMP_TO_EDGE);
+        glCtx.texParameteri(glCtx.TEXTURE_2D, glCtx.TEXTURE_WRAP_T, glCtx.CLAMP_TO_EDGE);
+        const fbo = glCtx.createFramebuffer();
+        glCtx.bindFramebuffer(glCtx.FRAMEBUFFER, fbo);
+        glCtx.framebufferTexture2D(glCtx.FRAMEBUFFER, glCtx.COLOR_ATTACHMENT0, glCtx.TEXTURE_2D, tex, 0);
+        glCtx.bindFramebuffer(glCtx.FRAMEBUFFER, null);
+        glCtx.bindTexture(glCtx.TEXTURE_2D, null);
+        return { fbo, tex, w, h };
+    }
+
+    function deleteFBO(f) {
+        if (!f) return;
+        glCtx.deleteFramebuffer(f.fbo);
+        glCtx.deleteTexture(f.tex);
+    }
+
+    let fboA = makeFBO(width, height);
+    let fboB = makeFBO(width, height);
+
+    // Clear both FBOs to black
+    function clearFBO(f) {
+        glCtx.bindFramebuffer(glCtx.FRAMEBUFFER, f.fbo);
+        glCtx.clearColor(0, 0, 0, 1);
+        glCtx.clear(glCtx.COLOR_BUFFER_BIT);
+        glCtx.bindFramebuffer(glCtx.FRAMEBUFFER, null);
+    }
+    clearFBO(fboA);
+    clearFBO(fboB);
+
+    // ---------- VAOs ----------
+    function makeQuadVAO(prog) {
+        const vao = glCtx.createVertexArray();
+        glCtx.bindVertexArray(vao);
+        glCtx.bindBuffer(glCtx.ARRAY_BUFFER, quadBuf);
+        const loc = glCtx.getAttribLocation(prog, 'a_pos');
+        glCtx.enableVertexAttribArray(loc);
+        glCtx.vertexAttribPointer(loc, 2, glCtx.FLOAT, false, 0, 0);
+        glCtx.bindVertexArray(null);
+        return vao;
+    }
+
+    const fadeVAO  = makeQuadVAO(fadeProg);
+    const blitVAO  = makeQuadVAO(blitProg);
+
+    const particleVAO = glCtx.createVertexArray();
+    glCtx.bindVertexArray(particleVAO);
+    glCtx.bindBuffer(glCtx.ARRAY_BUFFER, particleBuf);
+    const STRIDE = PARTICLE_FLOATS * 4;
+    function pAttrib(prog, name, size, offset) {
+        const loc = glCtx.getAttribLocation(prog, name);
+        if (loc >= 0) {
+            glCtx.enableVertexAttribArray(loc);
+            glCtx.vertexAttribPointer(loc, size, glCtx.FLOAT, false, STRIDE, offset * 4);
+        }
+    }
+    pAttrib(particleProg, 'a_pos',     2, 0);
+    pAttrib(particleProg, 'a_size',    1, 2);
+    pAttrib(particleProg, 'a_opacity', 1, 3);
+    pAttrib(particleProg, 'a_color',   3, 4);
+    glCtx.bindVertexArray(null);
+
+    // ---------- uniform locations ----------
+    const uFadeTrail      = glCtx.getUniformLocation(fadeProg, 'u_trail');
+    const uFadeRes        = glCtx.getUniformLocation(fadeProg, 'u_resolution');
+    const uFadeHold       = glCtx.getUniformLocation(fadeProg, 'u_holdThreshold');
+    const uFadeSlow       = glCtx.getUniformLocation(fadeProg, 'u_slowFade');
+    const uFadeFast       = glCtx.getUniformLocation(fadeProg, 'u_fastFade');
+    const uBlitTrail      = glCtx.getUniformLocation(blitProg,  'u_trail');
+    const uBlitRes        = glCtx.getUniformLocation(blitProg,  'u_resolution');
+
+    // Normalised fade constants
+    const HOLD_N  = FADE_HOLD_THRESHOLD / 255;
+    const SLOW_N  = FADE_SLOW_AMOUNT    / 255;
+    const FAST_N  = FADE_FAST_AMOUNT    / 255;
+
+    // ---------- renderer object ----------
+    const renderer = {
+        resize(w, h) {
+            deleteFBO(fboA);
+            deleteFBO(fboB);
+            fboA = makeFBO(w, h);
+            fboB = makeFBO(w, h);
+            clearFBO(fboA);
+            clearFBO(fboB);
+        },
+
+        clearTrail() {
+            clearFBO(fboA);
+            clearFBO(fboB);
+        },
+
+        render(opts) {
+            const {
+                parts, fadeThisFrame, connectFade,
+                transparent, sourceColors, dpr,
+            } = opts;
+
+            const W = glCtx.drawingBufferWidth;
+            const H = glCtx.drawingBufferHeight;
+
+            // ---- pass 1: fade fboA → fboB ----
+            if (fadeThisFrame) {
+                glCtx.bindFramebuffer(glCtx.FRAMEBUFFER, fboB.fbo);
+                glCtx.viewport(0, 0, W, H);
+                glCtx.useProgram(fadeProg);
+                glCtx.activeTexture(glCtx.TEXTURE0);
+                glCtx.bindTexture(glCtx.TEXTURE_2D, fboA.tex);
+                glCtx.uniform1i(uFadeTrail, 0);
+                glCtx.uniform2f(uFadeRes, W, H);
+                glCtx.uniform1f(uFadeHold, HOLD_N);
+                glCtx.uniform1f(uFadeSlow, SLOW_N);
+                glCtx.uniform1f(uFadeFast, FAST_N);
+                glCtx.bindVertexArray(fadeVAO);
+                glCtx.drawArrays(glCtx.TRIANGLES, 0, 6);
+            } else {
+                // No fade this frame: copy fboA → fboB unchanged
+                // (blit is cheaper than a full fade pass)
+                glCtx.bindFramebuffer(glCtx.READ_FRAMEBUFFER, fboA.fbo);
+                glCtx.bindFramebuffer(glCtx.DRAW_FRAMEBUFFER, fboB.fbo);
+                glCtx.blitFramebuffer(0, 0, W, H, 0, 0, W, H, glCtx.COLOR_BUFFER_BIT, glCtx.NEAREST);
+            }
+
+            // ---- pass 2: draw particles into fboB ----
+            glCtx.bindFramebuffer(glCtx.FRAMEBUFFER, fboB.fbo);
+            glCtx.viewport(0, 0, W, H);
+            glCtx.enable(glCtx.BLEND);
+            glCtx.blendFunc(glCtx.ONE, glCtx.ONE_MINUS_SRC_ALPHA); // pre-multiplied alpha
+
+            let pCount = 0;
+            const WHITE = [1, 1, 1];
+            for (let i = 0; i < parts.length; i++) {
+                const p = parts[i];
+                if (p.opacity <= MIN_DRAW_OPACITY) continue;
+                const radius = p.radius;
+                if (radius < 0.1) continue;
+                const opacity = (transparent ? p.opacity * TRANSPARENT_OPACITY : p.opacity) * connectFade;
+                const size = radius * 2 * dpr;
+                const clr  = sourceColors ? RIVER_COLORS[p.sourceIdx % RIVER_COLORS.length] : null;
+                const r = clr ? clr[0] / 255 : 1;
+                const g = clr ? clr[1] / 255 : 1;
+                const b = clr ? clr[2] / 255 : 1;
+                const base = pCount * PARTICLE_FLOATS;
+                particleData[base]     = (p.x / width)  *  2 - 1;
+                particleData[base + 1] = (p.y / height) * -2 + 1;
+                particleData[base + 2] = Math.max(1, size);
+                particleData[base + 3] = opacity;
+                particleData[base + 4] = r;
+                particleData[base + 5] = g;
+                particleData[base + 6] = b;
+                pCount++;
+                if (pCount >= MAX_PARTICLES) break;
+            }
+
+            if (pCount > 0) {
+                glCtx.useProgram(particleProg);
+                glCtx.bindBuffer(glCtx.ARRAY_BUFFER, particleBuf);
+                glCtx.bufferSubData(glCtx.ARRAY_BUFFER, 0, particleData, 0, pCount * PARTICLE_FLOATS);
+                glCtx.bindVertexArray(particleVAO);
+                glCtx.drawArrays(glCtx.POINTS, 0, pCount);
+            }
+
+            glCtx.disable(glCtx.BLEND);
+
+            // ---- pass 3: blit fboB → screen ----
+            glCtx.bindFramebuffer(glCtx.FRAMEBUFFER, null);
+            glCtx.viewport(0, 0, W, H);
+            glCtx.useProgram(blitProg);
+            glCtx.activeTexture(glCtx.TEXTURE0);
+            glCtx.bindTexture(glCtx.TEXTURE_2D, fboB.tex);
+            glCtx.uniform1i(uBlitTrail, 0);
+            glCtx.uniform2f(uBlitRes, W, H);
+            glCtx.bindVertexArray(blitVAO);
+            glCtx.drawArrays(glCtx.TRIANGLES, 0, 6);
+
+            // ---- swap FBOs ----
+            const tmp = fboA; fboA = fboB; fboB = tmp;
+
+            glCtx.bindVertexArray(null);
+        },
+    };
+
+    return renderer;
+}
+
+if (gl) {
+    glRenderer = initWebGL(gl);
+    if (!glRenderer) console.warn('WebGL2 init failed; falling back to Canvas2D.');
+}
+
+// ---- WebSocket ----
 
 function applyClientState(s) {
     if ('t' in s) transparentParticles  = s.t;
@@ -135,7 +439,6 @@ function applyDisplayTransform(t) {
     const tx = (t.insetLeft - t.insetRight) / 2 + (t.shiftRight - t.shiftLeft);
     const ty = (t.insetTop - t.insetBottom) / 2 + (t.shiftBottom - t.shiftTop);
     canvasWrap.style.transform = `translateX(${tx}%) translateY(${ty}%) scaleX(${sx}) scaleY(${sy})`;
-    // Power-curve fade: stays near-transparent toward content, drops to black quickly at screen edge
     function fadePow(dir, depth) {
         const d = depth * 50;
         return `linear-gradient(${dir}, ` +
@@ -169,7 +472,7 @@ function connect() {
 
     ws.onopen = () => {
         connected = true;
-        connectFadeFrame = 0; // restart fade-in
+        connectFadeFrame = 0;
         showStatus('Connected', true);
         if (isProjector) ws.send(JSON.stringify({ type: 'register', role: 'projector' }));
         ws.send(JSON.stringify({ type: 'client_dimensions', width, height }));
@@ -191,10 +494,28 @@ function connect() {
                 awaitingReset = false;
                 particles = [];
                 connectFadeFrame = 0;
+                if (glRenderer) glRenderer.clearTrail();
+            }
+            // Unit 3: server signals it will send Zstd-compressed binary frames
+            if (msg.type === 'encoding' && msg.compression === 'zstd') {
+                useZstd = typeof window.fzstd !== 'undefined';
+                if (useZstd) console.log('Zstd decompression enabled');
             }
             return;
         }
-        const view = new DataView(e.data);
+
+        // Unit 3: Decompress if server is sending Zstd frames
+        let rawBuf = e.data;
+        if (useZstd) {
+            try {
+                rawBuf = window.fzstd.decompress(new Uint8Array(e.data)).buffer;
+            } catch (err) {
+                console.warn('Zstd decompress failed, using raw:', err);
+                rawBuf = e.data;
+            }
+        }
+
+        const view = new DataView(rawBuf);
         const type = view.getUint8(0);
         if (type === 0x00) unpackParticles(view);
         else if (type === 0x01) unpackGrid(view, 'wetness');
@@ -204,26 +525,18 @@ function connect() {
     let rejected = false;
     ws.onclose = () => {
         connected = false;
-        if (rejected) return; // server refused us, don't retry
+        if (rejected) return;
         showStatus('Disconnected — reconnecting…');
         setTimeout(connect, 2000);
     };
-
-    ws.onerror = () => {
-        ws.close();
-    };
+    ws.onerror = () => { ws.close(); };
 }
 
-// Byte 0: type 0x00
-// Bytes 1-4: frameNum (uint32LE), bytes 5-8: count (uint32LE)
-// Per particle (8 bytes): x, y (uint16), opacity, radius (uint8), sourceIdx, flags (uint8)
 function unpackParticles(view) {
     frameNum = view.getUint32(1, true);
     const count = view.getUint32(5, true);
-
     while (particles.length < count) particles.push({});
     particles.length = count;
-
     let offset = 9;
     for (let i = 0; i < count; i++) {
         const p = particles[i];
@@ -239,7 +552,6 @@ function unpackParticles(view) {
     }
 }
 
-// Byte 0: type, bytes 1-2: cols, bytes 3-4: rows, bytes 5-8: maxVal, bytes 9+: uint8 data
 function unpackGrid(view, which) {
     const cols   = view.getUint16(1, true);
     const rows   = view.getUint16(3, true);
@@ -249,34 +561,28 @@ function unpackGrid(view, which) {
     else                     erosionGrid  = { cols, rows, maxVal, data };
 }
 
+// ---- Overlay & transform guide (Canvas2D on #overlay) ----
+
 function renderTransformOverlay() {
     const t = displayTransform;
     const W = width, H = height;
-
     const ix1 = t.insetLeft   / 100 * W;
     const iy1 = t.insetTop    / 100 * H;
     const ix2 = W - t.insetRight  / 100 * W;
     const iy2 = H - t.insetBottom / 100 * H;
-    const iw = Math.max(0, ix2 - ix1);
-    const ih = Math.max(0, iy2 - iy1);
-
-    const dx = (t.shiftRight - t.shiftLeft) / 100 * W;
-    const dy = (t.shiftBottom - t.shiftTop) / 100 * H;
-    const rx = ix1 + dx, ry = iy1 + dy;
-
-    // Cropped areas (red tint)
+    const iw  = Math.max(0, ix2 - ix1);
+    const ih  = Math.max(0, iy2 - iy1);
+    const dx  = (t.shiftRight - t.shiftLeft) / 100 * W;
+    const dy  = (t.shiftBottom - t.shiftTop) / 100 * H;
+    const rx  = ix1 + dx, ry = iy1 + dy;
     overlayCtx.fillStyle = 'rgba(120, 30, 30, 0.45)';
     if (t.insetTop    > 0) overlayCtx.fillRect(0, 0, W, iy1);
     if (t.insetBottom > 0) overlayCtx.fillRect(0, iy2, W, H - iy2);
     if (t.insetLeft   > 0) overlayCtx.fillRect(0, 0, ix1, H);
     if (t.insetRight  > 0) overlayCtx.fillRect(ix2, 0, W - ix2, H);
-
-    // Content rect border
     overlayCtx.strokeStyle = 'rgba(100, 130, 220, 0.85)';
     overlayCtx.lineWidth = 2;
     overlayCtx.strokeRect(rx, ry, iw, ih);
-
-    // Shift arrow (center → shifted center)
     if (dx !== 0 || dy !== 0) {
         const cx = W / 2, cy = H / 2;
         overlayCtx.strokeStyle = 'rgba(220, 200, 80, 0.75)';
@@ -292,8 +598,6 @@ function renderTransformOverlay() {
         overlayCtx.arc(cx + dx, cy + dy, 5, 0, Math.PI * 2);
         overlayCtx.fill();
     }
-
-    // Fade region indicators (blue tint, distinct from actual black fade)
     const fades = [
         { v: t.fadeTop,    x: rx,      y: ry,      w: iw,  h: ih * t.fadeTop    * 0.5, gx: [0,0,0,1] },
         { v: t.fadeBottom, x: rx,      y: ry + ih, w: iw,  h: ih * t.fadeBottom * 0.5, gx: [0,1,0,0] },
@@ -308,14 +612,9 @@ function renderTransformOverlay() {
         grad.addColorStop(0, 'rgba(60,80,180,0.55)');
         grad.addColorStop(1, 'rgba(60,80,180,0)');
         overlayCtx.fillStyle = grad;
-        overlayCtx.fillRect(
-            Math.min(x0, x1), Math.min(y0, y1),
-            f.w || iw, f.h || ih
-        );
+        overlayCtx.fillRect(Math.min(x0, x1), Math.min(y0, y1), f.w || iw, f.h || ih);
     }
 }
-
-// ---- Overlay rendering ----
 
 function renderWetness(grid) {
     const cellW = width  / grid.cols;
@@ -397,72 +696,86 @@ function animate() {
         }
     }
 
-    // Canvas fade — "hold then quickly fade" effect, every other RAF call
     fadeToggle = !fadeToggle;
-    if (fadeToggle) {
-        const imgData = ctx.getImageData(0, 0, width, height);
-        const data = imgData.data;
-        for (let j = 0; j < data.length; j += 4) {
-            const r = data[j];
-            if (r > 0) {
-                const fadeAmount = r > FADE_HOLD_THRESHOLD ? FADE_SLOW_AMOUNT : FADE_FAST_AMOUNT;
-                data[j]     -= fadeAmount;
-                data[j + 1] -= fadeAmount;
-                data[j + 2] -= fadeAmount;
-            }
-        }
-        ctx.putImageData(imgData, 0, 0);
 
-        // Subtle blur pass to soften trail edges — skip during fade-in to prevent bloom
-        if (connectFadeFrame >= CONNECT_FADE_IN_FRAMES) {
-            ctx.save();
-            ctx.filter = `blur(${TRAIL_BLUR_RADIUS}px)`;
-            ctx.globalAlpha = TRAIL_BLUR_ALPHA;
-            ctx.drawImage(canvas, 0, 0);
-            ctx.restore();
-        }
-    }
-
-    // Overlay heatmaps + transform guide
+    // Overlay heatmaps + transform guide (always Canvas2D)
     overlayCtx.clearRect(0, 0, width, height);
     if (wetnessOverlay && wetnessGrid) renderWetness(wetnessGrid);
     if (erosionOverlay  && erosionGrid)  renderErosion(erosionGrid);
     if (transformOverlayVisible) renderTransformOverlay();
 
-    if (awaitingReset || particles.length === 0) return;
+    if (awaitingReset || particles.length === 0) {
+        // Keep canvas black during reset
+        if (!glRenderer && ctx) {
+            if (fadeToggle) {
+                ctx.globalCompositeOperation = 'destination-out';
+                ctx.fillStyle = `rgba(0,0,0,${FADE_FAST_AMOUNT / 255})`;
+                ctx.fillRect(0, 0, width, height);
+                ctx.globalCompositeOperation = 'source-over';
+            }
+        }
+        return;
+    }
 
-    // Ramp opacity up from 0 on first connect to avoid the "explosion" of
-    // all particles appearing at once on a fresh black canvas
     const connectFade = Math.min(connectFadeFrame / CONNECT_FADE_IN_FRAMES, 1.0);
     if (connectFadeFrame < CONNECT_FADE_IN_FRAMES) connectFadeFrame++;
 
-    // Single-pass particle drawing
-    ctx.fillStyle = '#fff';
-    for (let i = 0; i < particles.length; i++) {
-        const p = particles[i];
-        if (p.opacity <= MIN_DRAW_OPACITY) continue;
+    const dpr = window.devicePixelRatio || 1;
 
-        const opacity = (transparentParticles ? p.opacity * TRANSPARENT_OPACITY : p.opacity) * connectFade;
-        const radius = p.radius;
-        if (radius < 0.1) continue;
+    if (glRenderer) {
+        // Unit 6: WebGL2 path
+        glRenderer.render({
+            parts: particles,
+            fadeThisFrame: fadeToggle,
+            connectFade,
+            transparent: transparentParticles,
+            sourceColors: sourceColorParticles,
+            dpr,
+        });
+    } else {
+        // Unit 1: Canvas2D fallback with destination-out fade (no getImageData)
+        if (fadeToggle) {
+            // destination-out replaces the expensive getImageData/putImageData loop.
+            // The uniform-rate fade approximates the "hold bright / fade dim" effect.
+            ctx.globalCompositeOperation = 'destination-out';
+            ctx.fillStyle = `rgba(0,0,0,${FADE_FAST_AMOUNT / 255})`;
+            ctx.fillRect(0, 0, width, height);
+            ctx.globalCompositeOperation = 'source-over';
 
-        if (sourceColorParticles) {
-            const clr = RIVER_COLORS[p.sourceIdx % RIVER_COLORS.length];
-            ctx.fillStyle = `rgb(${clr[0]},${clr[1]},${clr[2]})`;
-        } else {
-            ctx.fillStyle = '#fff';
+            // Subtle blur softens trail edges (skip during fade-in)
+            if (connectFadeFrame >= CONNECT_FADE_IN_FRAMES) {
+                ctx.save();
+                ctx.filter = `blur(${TRAIL_BLUR_RADIUS}px)`;
+                ctx.globalAlpha = TRAIL_BLUR_ALPHA;
+                ctx.drawImage(canvas, 0, 0);
+                ctx.restore();
+            }
         }
-        ctx.globalAlpha = opacity;
 
-        const d = radius * 2;
-        ctx.fillRect(p.x - radius, p.y - radius, d, d);
+        // Draw particles with fillRect
+        ctx.fillStyle = '#fff';
+        for (let i = 0; i < particles.length; i++) {
+            const p = particles[i];
+            if (p.opacity <= MIN_DRAW_OPACITY) continue;
+            const opacity = (transparentParticles ? p.opacity * TRANSPARENT_OPACITY : p.opacity) * connectFade;
+            const radius = p.radius;
+            if (radius < 0.1) continue;
+            if (sourceColorParticles) {
+                const clr = RIVER_COLORS[p.sourceIdx % RIVER_COLORS.length];
+                ctx.fillStyle = `rgb(${clr[0]},${clr[1]},${clr[2]})`;
+            } else {
+                ctx.fillStyle = '#fff';
+            }
+            ctx.globalAlpha = opacity;
+            const d = radius * 2;
+            ctx.fillRect(p.x - radius, p.y - radius, d, d);
+        }
+        ctx.globalAlpha = 1.0;
     }
-    ctx.globalAlpha = 1.0;
 }
 
 // ---- Keyboard ----
 
-// Handle client-local keys — called from keyboard events and remote control panel
 function handleClientKey(key) {
     if (key === 'h' || key === 'H') {
         hintVisible = !hintVisible;
@@ -470,69 +783,49 @@ function handleClientKey(key) {
         fpsEl.classList.toggle('hidden', !hintVisible);
         return;
     }
-    if (key === 't' || key === 'T') {
-        transparentParticles = !transparentParticles;
-        updateHint();
-        return;
-    }
-    if (key === 'c' || key === 'C') {
-        sourceColorParticles = !sourceColorParticles;
-        updateHint();
-        return;
-    }
+    if (key === 't' || key === 'T') { transparentParticles = !transparentParticles; updateHint(); return; }
+    if (key === 'c' || key === 'C') { sourceColorParticles = !sourceColorParticles; updateHint(); return; }
     if (key === 'w' || key === 'W') {
         wetnessOverlay = !wetnessOverlay;
         if (!wetnessOverlay) wetnessGrid = null;
-        if (ws && ws.readyState === WebSocket.OPEN) {
+        if (ws && ws.readyState === WebSocket.OPEN)
             ws.send(JSON.stringify({ type: 'overlay', grid: 'wetness' }));
-        }
         updateHint();
         return;
     }
     if (key === 'e' || key === 'E') {
         erosionOverlay = !erosionOverlay;
         if (!erosionOverlay) erosionGrid = null;
-        if (ws && ws.readyState === WebSocket.OPEN) {
+        if (ws && ws.readyState === WebSocket.OPEN)
             ws.send(JSON.stringify({ type: 'overlay', grid: 'erosion' }));
-        }
         updateHint();
         return;
     }
     if (key === 'b' || key === 'B') { capillaryDiversion = !capillaryDiversion; updateHint(); }
     if (key === 'm' || key === 'M') { mixSources = !mixSources; updateHint(); }
     if (key === 'transform_overlay_toggle') { transformOverlayVisible = !transformOverlayVisible; return; }
-    if (key === 'transform_overlay_refresh') { /* overlay redraws automatically next frame */ return; }
+    if (key === 'transform_overlay_refresh') { return; }
     if (key === 'reload') {
-        ctx.fillStyle = 'black';
-        ctx.fillRect(0, 0, width, height);
+        if (ctx) { ctx.fillStyle = 'black'; ctx.fillRect(0, 0, width, height); }
+        if (glRenderer) glRenderer.clearTrail();
         awaitingReset = true;
         window.location.reload();
     }
 }
 
 window.addEventListener('keydown', (e) => {
-    // Client-local keys
-    if ('hHtTcCwWeE'.includes(e.key)) {
-        handleClientKey(e.key);
-        return;
-    }
-
-    // Reset simulation
+    if ('hHtTcCwWeE'.includes(e.key)) { handleClientKey(e.key); return; }
     if (e.key === '0') {
-        if (ws && ws.readyState === WebSocket.OPEN) {
+        if (ws && ws.readyState === WebSocket.OPEN)
             ws.send(JSON.stringify({ type: 'reset' }));
-        }
-        ctx.fillStyle = 'black';
-        ctx.fillRect(0, 0, width, height);
+        if (ctx) { ctx.fillStyle = 'black'; ctx.fillRect(0, 0, width, height); }
+        if (glRenderer) glRenderer.clearTrail();
         particles = [];
         awaitingReset = true;
         return;
     }
-
-    // Forward to server for simulation control (server echoes B/M back via client_key)
-    if (ws && ws.readyState === WebSocket.OPEN) {
+    if (ws && ws.readyState === WebSocket.OPEN)
         ws.send(JSON.stringify({ type: 'key', key: e.key }));
-    }
 });
 
 // ---- Mouse forwarding (optional) ----
@@ -548,7 +841,7 @@ window.addEventListener('keydown', (e) => {
 //     }
 // });
 // canvas.addEventListener('mousedown', (e) => { if (e.button === 0) mouseLeftDown = true; });
-// canvas.addEventListener('mouseup', (e) => { if (e.button === 0) mouseLeftDown = false; });
+// canvas.addEventListener('mouseup',   (e) => { if (e.button === 0) mouseLeftDown = false; });
 
 // ---- Start ----
 

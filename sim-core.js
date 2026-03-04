@@ -4,6 +4,7 @@
 const _perf = globalThis.performance ?? { now: () => Date.now() };
 
 const SimplexNoise = require('simplex-noise');
+const noiseGrid = require('./noise-grid.js');
 
 // ==========================================
 // CONFIGURATION & TUNING VARIABLES
@@ -253,6 +254,7 @@ function resize(w, h) {
     width = w;
     height = h;
 
+    noiseGrid.resize(width, height);
     cols = Math.ceil(width / GRID_SIZE);
     rows = Math.ceil(height / GRID_SIZE);
     wetnessGrid = new Float32Array(cols * rows);
@@ -355,15 +357,9 @@ class Particle {
     update() {
         if (this.isCapillary) { this._updateCapillary(); return; }
 
-        const n1 = fbm(this.x * NOISE_SCALE, this.y * NOISE_SCALE, zOff);
-        const nx = fbm((this.x + NOISE_EPSILON) * NOISE_SCALE, this.y * NOISE_SCALE, zOff);
-        const ny = fbm(this.x * NOISE_SCALE, (this.y + NOISE_EPSILON) * NOISE_SCALE, zOff);
-
-        const dx = (nx - n1) / NOISE_EPSILON;
-        const dy = (ny - n1) / NOISE_EPSILON;
-
-        let forceX = -dx;
-        let forceY = -dy;
+        const [forceX0, forceY0] = noiseGrid.sample(this.x, this.y);
+        let forceX = forceX0;
+        let forceY = forceY0;
 
         let gradLen = Math.sqrt(forceX * forceX + forceY * forceY) || 1;
         forceX /= gradLen;
@@ -958,11 +954,19 @@ function tick() {
     simSpeedAccum -= ticksThisFrame;
 
     for (let t = 0; t < ticksThisFrame; t++) {
-        // Evaporate wetness grid and slowly decay erosion
-        for (let k = 0; k < wetnessGrid.length; k++) {
-            wetnessGrid[k] *= EVAPORATION_RATE;
-            if (wetnessGrid[k] < 0.1) sourceOwnerGrid[k] = -1;
+        // Evaporate wetness and erosion grids.
+        // Split into two tight loops so V8 can vectorise the float multiply pass
+        // without being blocked by the mixed conditional capillary logic.
+
+        // Loop 1: main grids (hot, no branches, vectorisable)
+        const gridLen = wetnessGrid.length;
+        for (let k = 0; k < gridLen; k++) {
+            if ((wetnessGrid[k] *= EVAPORATION_RATE) < 0.1) sourceOwnerGrid[k] = -1;
             erosionGrid[k] *= EROSION_DECAY;
+        }
+
+        // Loop 2: capillary grids (conditional, but most cells are zero)
+        for (let k = 0; k < gridLen; k++) {
             if (capFadeMask[k]) {
                 capWetnessGrid[k] *= CAP_ACCEL_WETNESS_DECAY;
                 capErosionGrid[k] *= CAP_ACCEL_EROSION_DECAY;
@@ -1045,6 +1049,10 @@ function tick() {
                 }
             }
         }
+
+        // Rebuild curl-noise grid once per tick; particle updates bilinearly
+        // interpolate from it instead of calling fbm() 3× per particle.
+        noiseGrid.build(fbm, NOISE_SCALE, NOISE_EPSILON, zOff);
 
         for (let i = 0; i < particles.length; i++) {
             particles[i].update();

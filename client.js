@@ -64,6 +64,9 @@ const wsUrl = serverAddr
 const isProjector = params.get('role') === 'projector';
 
 let particles = [];
+const NUM_PARTICLES_MAX = 30000;
+const prevXClient = new Int32Array(NUM_PARTICLES_MAX);
+const prevYClient = new Int32Array(NUM_PARTICLES_MAX);
 let transparentParticles = false;
 let sourceColorParticles = false;
 let wetnessOverlay = false;
@@ -454,6 +457,22 @@ if (gl) {
     if (!glRenderer) console.warn('WebGL2 init failed; falling back to Canvas2D.');
 }
 
+// ---- Delta frame helpers ----
+
+function readVarint(buf, offset) {
+    let value = 0, shift = 0, b;
+    do {
+        b = buf[offset++];
+        value |= (b & 0x7F) << shift;
+        shift += 7;
+    } while (b & 0x80);
+    return { value, offset };
+}
+
+function zigzagDecode(n) {
+    return (n >>> 1) ^ -(n & 1);
+}
+
 // ---- WebSocket ----
 
 function applyClientState(s) {
@@ -554,7 +573,7 @@ function connect() {
 
         const view = new DataView(rawBuf);
         const type = view.getUint8(0);
-        if (type === 0x00) {
+        if (type === 0x00 || type === 0x03) {
             particleFrameCount++;
             const now = performance.now();
             const elapsed = now - particleFpsWindowStart;
@@ -563,7 +582,8 @@ function connect() {
                 particleFrameCount = 0;
                 particleFpsWindowStart = now;
             }
-            unpackParticles(view);
+            if (type === 0x00) unpackParticles(view);
+            else               unpackParticlesDelta(new Uint8Array(rawBuf), view);
         }
         else if (type === 0x01) unpackGrid(view, 'wetness');
         else if (type === 0x02) unpackGrid(view, 'erosion');
@@ -572,6 +592,8 @@ function connect() {
     let rejected = false;
     ws.onclose = () => {
         connected = false;
+        prevXClient.fill(0);
+        prevYClient.fill(0);
         if (rejected) return;
         showStatus('Disconnected — reconnecting…');
         setTimeout(connect, 2000);
@@ -595,6 +617,41 @@ function unpackParticles(view) {
         p.radius     = view.getUint8(offset++) / 10;
         p.sourceIdx  = view.getUint8(offset++);
         const flags  = view.getUint8(offset++);
+        p.isCapillary = (flags & 1) !== 0;
+    }
+}
+
+function unpackParticlesDelta(buf, view) {
+    frameNum = view.getUint32(1, true);
+    const activeCount = view.getUint32(5, true);
+    while (particles.length < activeCount) particles.push({});
+    particles.length = activeCount;
+
+    let offset = 9;
+
+    // Read X column (zigzag varint deltas)
+    for (let i = 0; i < activeCount; i++) {
+        const r = readVarint(buf, offset);
+        offset = r.offset;
+        prevXClient[i] += zigzagDecode(r.value);
+        particles[i].x = prevXClient[i] / 65535 * width;
+    }
+
+    // Read Y column (zigzag varint deltas)
+    for (let i = 0; i < activeCount; i++) {
+        const r = readVarint(buf, offset);
+        offset = r.offset;
+        prevYClient[i] += zigzagDecode(r.value);
+        particles[i].y = prevYClient[i] / 65535 * height;
+    }
+
+    // Read scalar column (opacity, radius, sourceIdx, flags — raw uint8 each)
+    for (let i = 0; i < activeCount; i++) {
+        const p = particles[i];
+        p.opacity     = buf[offset++] / 255;
+        p.radius      = buf[offset++] / 10;
+        p.sourceIdx   = buf[offset++];
+        const flags   = buf[offset++];
         p.isCapillary = (flags & 1) !== 0;
     }
 }

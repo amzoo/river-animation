@@ -1233,33 +1233,49 @@ function tick() {
 }
 
 // All server→client binary messages begin with a type byte:
-//   0x00 = particle frame
+//   0x03 = delta particle frame (columnar zigzag varint)
 //   0x01 = wetness grid
 //   0x02 = erosion grid
 
+// --- Delta frame state ---
+const _prevX = new Int32Array(NUM_PARTICLES);
+const _prevY = new Int32Array(NUM_PARTICLES);
+
+// Pre-allocated column buffers (worst-case 5 bytes per varint for X/Y columns)
+const _colX      = new Uint8Array(NUM_PARTICLES * 5);
+const _colY      = new Uint8Array(NUM_PARTICLES * 5);
+// 4 uint8 scalars per particle: opacity, radius, sourceIdx, flags
+const _colScalar = new Uint8Array(NUM_PARTICLES * 4);
+// Output frame buffer: 9-byte header + worst-case full columns
+const _frameBuf  = new Uint8Array(9 + NUM_PARTICLES * (5 + 5 + 4));
+
+function zigzagEncode(n) {
+    return (n << 1) ^ (n >> 31);
+}
+
+function writeVarint(value, buf, offset) {
+    while (value > 0x7F) {
+        buf[offset++] = (value & 0x7F) | 0x80;
+        value >>>= 7;
+    }
+    buf[offset++] = value & 0x7F;
+    return offset;
+}
+
 // Pack all visible particle render data into a compact binary Buffer.
-// Byte 0: type 0x00
-// Bytes 1-4: frameNum (uint32LE), bytes 5-8: particleCount (uint32LE)
-// Per particle (8 bytes): x (uint16), y (uint16), opacity (uint8 * 255),
-//   radius (uint8 * 10), sourceIdx (uint8), flags (uint8: bit0=isCapillary)
-//
-// Optimisation: a module-level Uint32Array bitmask (activeMask) marks which
-// particles have drawOpacity > 0.  Only those particles are serialised, so
-// the inner loop visits zero bytes for invisible particles.  The output is
-// written into the module-level frameDataBuf (worst-case pre-allocated) and
-// returned as a subarray slice — no per-call heap allocation.
-//
-// client.js handles variable particleCount correctly: unpackParticles() reads
-// the count from the header (bytes 5-8) and resizes the particles array to
-// match, so it does NOT assume a fixed 30000-particle payload.
+// Byte 0: type 0x03 (delta frame)
+// Bytes 1-4: frameNum (uint32LE), bytes 5-8: activeCount (uint32LE)
+// Then columnar sections: X deltas (zigzag varint), Y deltas (zigzag varint),
+//   opacity (uint8), radius (uint8), sourceIdx (uint8), flags (uint8)
+// Uses SoA arrays; reuses module-level activeMask bitmask to skip invisible particles.
 function getFrameData() {
     const nWords = Math.ceil(NUM_PARTICLES / 32);
 
-    // --- Pass 1: build activeMask and count active particles ---
+    // Pass 1: build activeMask
     let activeCount = 0;
     for (let w = 0; w < nWords; w++) {
         let word = 0;
-        const base = w << 5; // w * 32
+        const base = w << 5;
         const end = Math.min(base + 32, NUM_PARTICLES);
         for (let i = base; i < end; i++) {
             if (opacity_arr[i] > MIN_DRAW_OPACITY) {
@@ -1270,21 +1286,9 @@ function getFrameData() {
         activeMask[w] = word;
     }
 
-    const buf = frameDataBuf;
+    let xOff = 0, yOff = 0, sOff = 0;
 
-    // --- Write header (9 bytes) using manual byte writes for speed ---
-    buf[0] = 0x00;
-    buf[1] = frameNum        & 0xFF;
-    buf[2] = (frameNum >> 8)  & 0xFF;
-    buf[3] = (frameNum >> 16) & 0xFF;
-    buf[4] = (frameNum >> 24) & 0xFF;
-    buf[5] = activeCount        & 0xFF;
-    buf[6] = (activeCount >> 8)  & 0xFF;
-    buf[7] = (activeCount >> 16) & 0xFF;
-    buf[8] = (activeCount >> 24) & 0xFF;
-
-    // --- Pass 2: iterate activeMask with LSB bit tricks, serialize active particles ---
-    let offset = 9;
+    // Pass 2: iterate active particles via bitmask, build columns
     for (let w = 0; w < nWords; w++) {
         let bits = activeMask[w];
         if (bits === 0) continue;
@@ -1296,22 +1300,18 @@ function getFrameData() {
 
             const i = base + bitPos;
 
-            // x (uint16LE, normalized 0–65535 across simulation width)
-            const xEnc = Math.max(0, Math.min(65535, Math.round(px_arr[i] / width * 65535)));
-            buf[offset]     =  xEnc        & 0xFF;
-            buf[offset + 1] = (xEnc >> 8)  & 0xFF;
-            offset += 2;
+            const ix = Math.max(0, Math.min(65535, Math.round(px_arr[i] / width  * 65535)));
+            const iy = Math.max(0, Math.min(65535, Math.round(py_arr[i] / height * 65535)));
+            const dx = ix - _prevX[i];
+            const dy = iy - _prevY[i];
+            _prevX[i] = ix;
+            _prevY[i] = iy;
 
-            // y (uint16LE, normalized 0–65535 across simulation height)
-            const yEnc = Math.max(0, Math.min(65535, Math.round(py_arr[i] / height * 65535)));
-            buf[offset]     =  yEnc        & 0xFF;
-            buf[offset + 1] = (yEnc >> 8)  & 0xFF;
-            offset += 2;
+            xOff = writeVarint(zigzagEncode(dx), _colX, xOff);
+            yOff = writeVarint(zigzagEncode(dy), _colY, yOff);
 
-            // opacity (uint8, opacity * 255)
-            buf[offset++] = Math.max(0, Math.min(255, Math.round(opacity_arr[i] * 255)));
+            _colScalar[sOff++] = Math.max(0, Math.min(255, Math.round(opacity_arr[i] * 255)));
 
-            // radius (uint8, radius * 10)
             let radius;
             const isCapillary = (flags_arr[i] & FLAG_IS_CAPILLARY) !== 0;
             if (isCapillary) {
@@ -1324,18 +1324,31 @@ function getFrameData() {
                 radius = weight_arr[i] * PARTICLE_RADIUS_SCALE * Math.sin((age_arr[i] / life_arr[i]) * Math.PI);
                 if ((flags_arr[i] & FLAG_IN_DELTA) !== 0) radius = Math.max(radius, DELTA_MIN_RADIUS);
             }
-            buf[offset++] = Math.max(0, Math.min(255, Math.round(radius * 10)));
+            _colScalar[sOff++] = Math.max(0, Math.min(255, Math.round(radius * 10)));
 
-            // sourceIdx (uint8)
-            buf[offset++] = sourceIdx_arr[i] & 0xFF;
-
-            // flags (uint8): bit 0 = isCapillary
-            buf[offset++] = isCapillary ? 1 : 0;
+            _colScalar[sOff++] = sourceIdx_arr[i] & 0xFF;
+            _colScalar[sOff++] = isCapillary ? 1 : 0;
         }
     }
 
-    // Return only the filled portion — avoids sending trailing zeros over the wire
-    return buf.subarray(0, offset);
+    // Write 9-byte header
+    _frameBuf[0] = 0x03;
+    _frameBuf[1] =  frameNum        & 0xFF;
+    _frameBuf[2] = (frameNum >>> 8)  & 0xFF;
+    _frameBuf[3] = (frameNum >>> 16) & 0xFF;
+    _frameBuf[4] = (frameNum >>> 24) & 0xFF;
+    _frameBuf[5] =  activeCount        & 0xFF;
+    _frameBuf[6] = (activeCount >>> 8)  & 0xFF;
+    _frameBuf[7] = (activeCount >>> 16) & 0xFF;
+    _frameBuf[8] = (activeCount >>> 24) & 0xFF;
+
+    // Copy columns sequentially after header
+    let out = 9;
+    _frameBuf.set(_colX.subarray(0, xOff), out);      out += xOff;
+    _frameBuf.set(_colY.subarray(0, yOff), out);      out += yOff;
+    _frameBuf.set(_colScalar.subarray(0, sOff), out); out += sOff;
+
+    return Buffer.from(_frameBuf.buffer, _frameBuf.byteOffset, out);
 }
 
 // Pack a wetness or erosion grid into a compact binary Buffer.
@@ -1412,6 +1425,8 @@ function reset() {
     zOff = 0;
     frameNum = 0;
     simSpeedAccum = 0;
+    _prevX.fill(0);
+    _prevY.fill(0);
     recycledCapillaryCount = 0;
     wetnessGrid.fill(0);
     erosionGrid.fill(0);

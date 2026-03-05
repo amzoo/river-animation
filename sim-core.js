@@ -307,6 +307,12 @@ const FLAG_IS_SOURCE    = 0x02;
 const FLAG_IN_DELTA     = 0x04;
 const FLAG_RECYCLED     = 0x08;
 
+// --- Pre-allocated buffers for getFrameData() (reused every frame, no per-call alloc) ---
+// activeMask: one bit per particle; bit set when opacity > MIN_DRAW_OPACITY
+const activeMask = new Uint32Array(Math.ceil(NUM_PARTICLES / 32));
+// frameDataBuf: worst-case output buffer (all particles active)
+const frameDataBuf = new Uint8Array(NUM_PARTICLES * 8 + 9);
+
 const simplex = new SimplexNoise();
 
 function fbm(x, y, z) {
@@ -1236,58 +1242,100 @@ function tick() {
 // Bytes 1-4: frameNum (uint32LE), bytes 5-8: particleCount (uint32LE)
 // Per particle (8 bytes): x (uint16), y (uint16), opacity (uint8 * 255),
 //   radius (uint8 * 10), sourceIdx (uint8), flags (uint8: bit0=isCapillary)
+//
+// Optimisation: a module-level Uint32Array bitmask (activeMask) marks which
+// particles have drawOpacity > 0.  Only those particles are serialised, so
+// the inner loop visits zero bytes for invisible particles.  The output is
+// written into the module-level frameDataBuf (worst-case pre-allocated) and
+// returned as a subarray slice — no per-call heap allocation.
+//
+// client.js handles variable particleCount correctly: unpackParticles() reads
+// the count from the header (bytes 5-8) and resizes the particles array to
+// match, so it does NOT assume a fixed 30000-particle payload.
 function getFrameData() {
-    // Count visible particles
-    let count = 0;
-    for (let i = 0; i < NUM_PARTICLES; i++) {
-        if (opacity_arr[i] > MIN_DRAW_OPACITY) count++;
-    }
+    const nWords = Math.ceil(NUM_PARTICLES / 32);
 
-    const buf = Buffer.allocUnsafe(1 + 8 + count * 8);
-    buf.writeUInt8(0x00, 0);
-    buf.writeUInt32LE(frameNum, 1);
-    buf.writeUInt32LE(count, 5);
-
-    let offset = 9;
-    for (let i = 0; i < NUM_PARTICLES; i++) {
-        if (opacity_arr[i] <= MIN_DRAW_OPACITY) continue;
-
-        // x (uint16, normalized 0–65535 across simulation width)
-        const xEnc = Math.max(0, Math.min(65535, Math.round(px_arr[i] / width * 65535)));
-        buf.writeUInt16LE(xEnc, offset); offset += 2;
-
-        // y (uint16, normalized 0–65535 across simulation height)
-        const yEnc = Math.max(0, Math.min(65535, Math.round(py_arr[i] / height * 65535)));
-        buf.writeUInt16LE(yEnc, offset); offset += 2;
-
-        // opacity (uint8, opacity * 255)
-        const opacityEnc = Math.max(0, Math.min(255, Math.round(opacity_arr[i] * 255)));
-        buf.writeUInt8(opacityEnc, offset++);
-
-        // radius (uint8, radius * 10) — compute server-side
-        let radius;
-        const isCapillary = (flags_arr[i] & FLAG_IS_CAPILLARY) !== 0;
-        if (isCapillary) {
-            let c = Math.floor(px_arr[i] / GRID_SIZE);
-            let r = Math.floor(py_arr[i] / GRID_SIZE);
-            let capW = (c >= 0 && c < cols && r >= 0 && r < rows) ? capWetnessGrid[c + r * cols] : 0;
-            let thickness = Math.min(capW / CAP_THICKNESS_DIVISOR, 1.0);
-            radius = CAP_MIN_RADIUS + thickness * (CAPILLARY_MAX_RADIUS - CAP_MIN_RADIUS);
-        } else {
-            radius = weight_arr[i] * PARTICLE_RADIUS_SCALE * Math.sin((age_arr[i] / life_arr[i]) * Math.PI);
-            if ((flags_arr[i] & FLAG_IN_DELTA) !== 0) radius = Math.max(radius, DELTA_MIN_RADIUS);
+    // --- Pass 1: build activeMask and count active particles ---
+    let activeCount = 0;
+    for (let w = 0; w < nWords; w++) {
+        let word = 0;
+        const base = w << 5; // w * 32
+        const end = Math.min(base + 32, NUM_PARTICLES);
+        for (let i = base; i < end; i++) {
+            if (opacity_arr[i] > MIN_DRAW_OPACITY) {
+                word |= (1 << (i - base));
+                activeCount++;
+            }
         }
-        const radiusEnc = Math.max(0, Math.min(255, Math.round(radius * 10)));
-        buf.writeUInt8(radiusEnc, offset++);
-
-        // sourceIdx (uint8)
-        buf.writeUInt8(sourceIdx_arr[i] & 0xFF, offset++);
-
-        // flags (uint8): bit 0 = isCapillary
-        buf.writeUInt8(isCapillary ? 1 : 0, offset++);
+        activeMask[w] = word;
     }
 
-    return buf;
+    const buf = frameDataBuf;
+
+    // --- Write header (9 bytes) using manual byte writes for speed ---
+    buf[0] = 0x00;
+    buf[1] = frameNum        & 0xFF;
+    buf[2] = (frameNum >> 8)  & 0xFF;
+    buf[3] = (frameNum >> 16) & 0xFF;
+    buf[4] = (frameNum >> 24) & 0xFF;
+    buf[5] = activeCount        & 0xFF;
+    buf[6] = (activeCount >> 8)  & 0xFF;
+    buf[7] = (activeCount >> 16) & 0xFF;
+    buf[8] = (activeCount >> 24) & 0xFF;
+
+    // --- Pass 2: iterate activeMask with LSB bit tricks, serialize active particles ---
+    let offset = 9;
+    for (let w = 0; w < nWords; w++) {
+        let bits = activeMask[w];
+        if (bits === 0) continue;
+        const base = w << 5;
+        while (bits !== 0) {
+            const lsb = bits & (-bits);
+            const bitPos = 31 - Math.clz32(lsb);
+            bits &= bits - 1;
+
+            const i = base + bitPos;
+
+            // x (uint16LE, normalized 0–65535 across simulation width)
+            const xEnc = Math.max(0, Math.min(65535, Math.round(px_arr[i] / width * 65535)));
+            buf[offset]     =  xEnc        & 0xFF;
+            buf[offset + 1] = (xEnc >> 8)  & 0xFF;
+            offset += 2;
+
+            // y (uint16LE, normalized 0–65535 across simulation height)
+            const yEnc = Math.max(0, Math.min(65535, Math.round(py_arr[i] / height * 65535)));
+            buf[offset]     =  yEnc        & 0xFF;
+            buf[offset + 1] = (yEnc >> 8)  & 0xFF;
+            offset += 2;
+
+            // opacity (uint8, opacity * 255)
+            buf[offset++] = Math.max(0, Math.min(255, Math.round(opacity_arr[i] * 255)));
+
+            // radius (uint8, radius * 10)
+            let radius;
+            const isCapillary = (flags_arr[i] & FLAG_IS_CAPILLARY) !== 0;
+            if (isCapillary) {
+                const c = Math.floor(px_arr[i] / GRID_SIZE);
+                const r = Math.floor(py_arr[i] / GRID_SIZE);
+                const capW = (c >= 0 && c < cols && r >= 0 && r < rows) ? capWetnessGrid[c + r * cols] : 0;
+                const thickness = Math.min(capW / CAP_THICKNESS_DIVISOR, 1.0);
+                radius = CAP_MIN_RADIUS + thickness * (CAPILLARY_MAX_RADIUS - CAP_MIN_RADIUS);
+            } else {
+                radius = weight_arr[i] * PARTICLE_RADIUS_SCALE * Math.sin((age_arr[i] / life_arr[i]) * Math.PI);
+                if ((flags_arr[i] & FLAG_IN_DELTA) !== 0) radius = Math.max(radius, DELTA_MIN_RADIUS);
+            }
+            buf[offset++] = Math.max(0, Math.min(255, Math.round(radius * 10)));
+
+            // sourceIdx (uint8)
+            buf[offset++] = sourceIdx_arr[i] & 0xFF;
+
+            // flags (uint8): bit 0 = isCapillary
+            buf[offset++] = isCapillary ? 1 : 0;
+        }
+    }
+
+    // Return only the filled portion — avoids sending trailing zeros over the wire
+    return buf.subarray(0, offset);
 }
 
 // Pack a wetness or erosion grid into a compact binary Buffer.

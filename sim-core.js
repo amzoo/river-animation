@@ -6,6 +6,34 @@ const _perf = globalThis.performance ?? { now: () => Date.now() };
 const SimplexNoise = require('simplex-noise');
 const noiseGrid = require('./noise-grid.js');
 
+// Stage 3a: pre-computed noise grid dimensions (1/4-resolution relative to 3px sim grid)
+const NOISE_CELL_SIZE = 12; // pixels per noise-grid cell
+const GRID_COLS = Math.ceil(1920 / NOISE_CELL_SIZE); // 160
+const GRID_ROWS = Math.ceil(1080 / NOISE_CELL_SIZE); // 90
+
+// Bilinear lookup into a flat Float32Array grid of size (gridCols × gridRows).
+// x/y are pixel-space coordinates; returns clamped interpolated value.
+function bilinearLookup(grid, gridCols, gridRows, x, y) {
+    let gc = x / NOISE_CELL_SIZE;
+    let gr = y / NOISE_CELL_SIZE;
+    if (gc < 0) gc = 0;
+    if (gr < 0) gr = 0;
+    let c0 = gc | 0;
+    let r0 = gr | 0;
+    if (c0 > gridCols - 2) c0 = gridCols - 2;
+    if (r0 > gridRows - 2) r0 = gridRows - 2;
+    const fc  = gc - c0;
+    const fr  = gr - r0;
+    const ifc = 1.0 - fc;
+    const ifr = 1.0 - fr;
+    const i00 = c0     + r0       * gridCols;
+    const i10 = c0 + 1 + r0       * gridCols;
+    const i01 = c0     + (r0 + 1) * gridCols;
+    const i11 = c0 + 1 + (r0 + 1) * gridCols;
+    return grid[i00] * ifc * ifr + grid[i10] * fc * ifr +
+           grid[i01] * ifc * fr  + grid[i11] * fc * fr;
+}
+
 // ==========================================
 // CONFIGURATION & TUNING VARIABLES
 // (copied verbatim from script.js)
@@ -207,6 +235,7 @@ let width, height;
 let cols, rows;
 let wetnessGrid;
 let erosionGrid;
+let dirtyFlags; // Stage 3b: Uint8Array, one flag per wetnessGrid/erosionGrid cell
 let capWetnessGrid;
 let capErosionGrid;
 let capOwnerGrid;
@@ -295,6 +324,7 @@ function resize(w, h) {
     rows = Math.ceil(height / GRID_SIZE);
     wetnessGrid = new Float32Array(cols * rows);
     erosionGrid = new Float32Array(cols * rows);
+    dirtyFlags  = new Uint8Array(cols * rows); // Stage 3b: dirty region tracking
     capWetnessGrid = new Float32Array(cols * rows);
     capErosionGrid = new Float32Array(cols * rows);
     capOwnerGrid = new Int8Array(cols * rows);
@@ -613,6 +643,17 @@ function _updateRiver(i) {
             erosionGrid[idx] += EROSION_DEPOSIT;
         }
         let cellErosion = erosionGrid[idx];
+
+        // Stage 3b: mark cell and 8 neighbors dirty for diffusion/decay pass
+        for (let dr = -1; dr <= 1; dr++) {
+            const nr = r + dr;
+            if (nr < 0 || nr >= rows) continue;
+            for (let dc = -1; dc <= 1; dc++) {
+                const nc = c + dc;
+                if (nc < 0 || nc >= cols) continue;
+                dirtyFlags[nc + nr * cols] = 1;
+            }
+        }
 
         let convergeFactor = Math.min(py_arr[i] / (height * CONVERGENCE_RAMP_RATIO), 1.0);
         if (convergeFactor < 0) convergeFactor = 0;
@@ -1027,12 +1068,16 @@ function tick() {
         // Split into two tight loops so V8 can vectorise the float multiply pass
         // without being blocked by the mixed conditional capillary logic.
 
-        // Loop 1: main grids (hot, no branches, vectorisable)
+        // Loop 1: main grids — Stage 3b: only process dirty cells
+        // dirtyFlags is set by _updateRiver() when a particle deposits into a cell.
+        // Cells that haven't been written this tick are unchanged, so skip them.
         const gridLen = wetnessGrid.length;
         for (let k = 0; k < gridLen; k++) {
+            if (dirtyFlags[k] === 0) continue;
             if ((wetnessGrid[k] *= EVAPORATION_RATE) < 0.1) sourceOwnerGrid[k] = -1;
             erosionGrid[k] *= EROSION_DECAY;
         }
+        dirtyFlags.fill(0); // reset for next tick
 
         // Loop 2: capillary grids (conditional, but most cells are zero)
         for (let k = 0; k < gridLen; k++) {
@@ -1282,6 +1327,7 @@ function reset() {
     recycledCapillaryCount = 0;
     wetnessGrid.fill(0);
     erosionGrid.fill(0);
+    dirtyFlags.fill(0);
     capWetnessGrid.fill(0);
     capErosionGrid.fill(0);
     capOwnerGrid.fill(0);

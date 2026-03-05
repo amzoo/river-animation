@@ -1,13 +1,18 @@
 'use strict';
 
 // Worker thread: runs the river simulation loop independently of the
-// WebSocket event loop.  Frame data is transferred to the main thread via
-// postMessage (using transferable ArrayBuffers for zero-copy semantics).
+// WebSocket event loop.  Frame data is written into a SharedArrayBuffer
+// triple-buffer so the main thread can poll without serialization overhead.
 // Commands (key, reset, mouse, overlay) arrive from the main thread.
 
 const { parentPort, workerData } = require('worker_threads');
 const sim = require('./sim-core.js');
 const { SIM_WIDTH, SIM_HEIGHT, TARGET_FPS, GRID_SEND_EVERY } = require('./shared-state.js');
+
+const SLOT_SIZE = 512 * 1024;
+const { sab } = workerData;
+const ctrl = new Int32Array(sab, 0, 4);
+const slots = Array.from({ length: 3 }, (_, i) => new Uint8Array(sab, 16 + i * SLOT_SIZE, SLOT_SIZE));
 
 sim.resize(SIM_WIDTH, SIM_HEIGHT);
 
@@ -49,13 +54,18 @@ setInterval(() => {
     if (!running) return;
     sim.tick();
 
-    // Transfer particle frame (zero-copy: transfer the underlying ArrayBuffer)
-    const frameBuf = sim.getFrameData(); // Node Buffer
-    // Slice to its own ArrayBuffer so transfer doesn't clobber the pool
-    const ab = frameBuf.buffer.slice(frameBuf.byteOffset, frameBuf.byteOffset + frameBuf.byteLength);
-    parentPort.postMessage({ type: 'frame', buf: ab }, [ab]);
+    // Write frame into back slot of the SharedArrayBuffer triple-buffer
+    const frameData = sim.getFrameData();
+    const frameLen = frameData.byteLength;
+    const backSlot = ctrl[0];
+    new DataView(sab, 16 + backSlot * SLOT_SIZE, 4).setUint32(0, frameLen, true);
+    slots[backSlot].set(frameData, 4);
+    // Publish: swap back/spare, set dirty bit
+    const newSpare = (backSlot << 1) | 1;
+    const prev = Atomics.exchange(ctrl, 1, newSpare);
+    ctrl[0] = prev >> 1; // new back slot = old spare slot index
 
-    // Grid overlays at reduced rate
+    // Grid overlays at reduced rate (still sent via postMessage)
     if (frameCount % GRID_SEND_EVERY === 0) {
         if (wetnessOverlay) {
             const wb = sim.getWetnessData();

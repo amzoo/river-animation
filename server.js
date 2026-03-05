@@ -14,6 +14,9 @@ const { SIM_WIDTH, TARGET_FPS, GRID_SEND_EVERY } = require('./shared-state.js');
 
 const USE_ZSTD = typeof zlib.zstdCompressSync === 'function';
 
+const SLOT_SIZE = 512 * 1024;
+const NUM_SLOTS = 3;
+
 const STATE_FILE = path.join(__dirname, 'state.json');
 const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 8080;
 
@@ -53,8 +56,14 @@ console.log('State loaded from', STATE_FILE);
 
 // ---- Simulation worker ----
 
+const sab = new SharedArrayBuffer(4 * Int32Array.BYTES_PER_ELEMENT + NUM_SLOTS * SLOT_SIZE);
+const ctrl = new Int32Array(sab, 0, 4);
+// ctrl[0]=writeIdx (back slot), ctrl[1]=spare slot index with dirty bit (bit0=1 means new data),
+// ctrl[2]=frontIdx (server reads from), ctrl[3]=frameCounter
+ctrl[0] = 0; ctrl[1] = 1; ctrl[2] = 2; ctrl[3] = 0; // slots: 0=back, 1=spare, 2=front
+
 const worker = new Worker(path.join(__dirname, 'sim-worker.js'), {
-    workerData: { toggles: clientToggles },
+    workerData: { toggles: clientToggles, sab },
 });
 
 let simSpeed = 1;
@@ -76,13 +85,33 @@ worker.on('message', (msg) => {
         for (const c of clients) if (c.readyState === c.OPEN) c.send(ack);
         return;
     }
-    if (clients.size === 0) return;
-    if (msg.type === 'frame') fpsFrameCount++;
-    if (msg.type === 'frame' || msg.type === 'grid') {
+    if (msg.type === 'grid') {
+        if (clients.size === 0) return;
         const raw = Buffer.from(msg.buf);
         broadcastBinary(USE_ZSTD ? zlib.zstdCompressSync(raw, { level: 1 }) : raw);
     }
 });
+
+// ---- SharedArrayBuffer polling loop ----
+// Polls the triple-buffer for new frames written by sim-worker and broadcasts them.
+function pollFrames() {
+    const spareVal = Atomics.load(ctrl, 1);
+    if (spareVal & 1) {
+        // Dirty: swap front and spare atomically
+        const prev = Atomics.exchange(ctrl, 1, (ctrl[2] << 1) | 0);
+        ctrl[2] = prev >> 1;
+        // Read frame from front slot
+        const slotOffset = 16 + ctrl[2] * SLOT_SIZE;
+        const frameLen = new DataView(sab, slotOffset, 4).getUint32(0, true);
+        if (frameLen > 0 && clients.size > 0) {
+            const raw = Buffer.from(sab, slotOffset + 4, frameLen);
+            broadcastBinary(USE_ZSTD ? zlib.zstdCompressSync(raw, { level: 1 }) : raw);
+            fpsFrameCount++;
+        }
+    }
+    setImmediate(pollFrames);
+}
+setImmediate(pollFrames);
 
 worker.on('error', (err) => console.error('Sim worker error:', err));
 worker.on('exit', (code) => { if (code !== 0) console.error('Sim worker exited with code', code); });

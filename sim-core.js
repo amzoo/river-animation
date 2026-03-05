@@ -1069,67 +1069,106 @@ function tick() {
 }
 
 // All server→client binary messages begin with a type byte:
-//   0x00 = particle frame
+//   0x03 = delta particle frame (columnar zigzag varint)
 //   0x01 = wetness grid
 //   0x02 = erosion grid
 
-// Pack all visible particle render data into a compact binary Buffer.
-// Byte 0: type 0x00
-// Bytes 1-4: frameNum (uint32LE), bytes 5-8: particleCount (uint32LE)
-// Per particle (8 bytes): x (uint16), y (uint16), opacity (uint8 * 255),
-//   radius (uint8 * 10), sourceIdx (uint8), flags (uint8: bit0=isCapillary)
-function getFrameData() {
-    // Count visible particles
-    let count = 0;
-    for (let i = 0; i < particles.length; i++) {
-        if (particles[i].drawOpacity > MIN_DRAW_OPACITY) count++;
+// --- Delta frame state ---
+const _prevX = new Int32Array(NUM_PARTICLES);
+const _prevY = new Int32Array(NUM_PARTICLES);
+
+// Pre-allocated column buffers (worst-case 5 bytes per varint for X/Y columns)
+const _colX      = new Uint8Array(NUM_PARTICLES * 5);
+const _colY      = new Uint8Array(NUM_PARTICLES * 5);
+// 4 uint8 scalars per particle: opacity, radius, sourceIdx, flags
+const _colScalar = new Uint8Array(NUM_PARTICLES * 4);
+// Output frame buffer: 9-byte header + worst-case full columns
+const _frameBuf  = new Uint8Array(9 + NUM_PARTICLES * (5 + 5 + 4));
+
+function zigzagEncode(n) {
+    return (n << 1) ^ (n >> 31);
+}
+
+function writeVarint(value, buf, offset) {
+    while (value > 0x7F) {
+        buf[offset++] = (value & 0x7F) | 0x80;
+        value >>>= 7;
     }
+    buf[offset++] = value & 0x7F;
+    return offset;
+}
 
-    const buf = Buffer.allocUnsafe(1 + 8 + count * 8);
-    buf.writeUInt8(0x00, 0);
-    buf.writeUInt32LE(frameNum, 1);
-    buf.writeUInt32LE(count, 5);
+// Pack all visible particle render data into a compact binary Buffer.
+// Byte 0: type 0x03 (delta frame)
+// Bytes 1-4: frameNum (uint32LE), bytes 5-8: activeCount (uint32LE)
+// Then columnar sections: X deltas (zigzag varint), Y deltas (zigzag varint),
+//   opacity (uint8), radius (uint8), sourceIdx (uint8), flags (uint8)
+function getFrameData() {
+    let activeCount = 0;
+    let xOff = 0, yOff = 0, sOff = 0;
 
-    let offset = 9;
     for (let i = 0; i < particles.length; i++) {
         const p = particles[i];
         if (p.drawOpacity <= MIN_DRAW_OPACITY) continue;
 
-        // x (uint16, normalized 0–65535 across simulation width)
-        const xEnc = Math.max(0, Math.min(65535, Math.round(p.x / width * 65535)));
-        buf.writeUInt16LE(xEnc, offset); offset += 2;
+        // Fixed-point position (uint16 scale, matching legacy format)
+        const ix = Math.max(0, Math.min(65535, Math.round(p.x / width  * 65535)));
+        const iy = Math.max(0, Math.min(65535, Math.round(p.y / height * 65535)));
 
-        // y (uint16, normalized 0–65535 across simulation height)
-        const yEnc = Math.max(0, Math.min(65535, Math.round(p.y / height * 65535)));
-        buf.writeUInt16LE(yEnc, offset); offset += 2;
+        // Delta from previous frame position for this particle slot
+        const dx = ix - _prevX[i];
+        const dy = iy - _prevY[i];
+        _prevX[i] = ix;
+        _prevY[i] = iy;
 
-        // opacity (uint8, opacity * 255)
-        const opacityEnc = Math.max(0, Math.min(255, Math.round(p.drawOpacity * 255)));
-        buf.writeUInt8(opacityEnc, offset++);
+        xOff = writeVarint(zigzagEncode(dx), _colX, xOff);
+        yOff = writeVarint(zigzagEncode(dy), _colY, yOff);
 
-        // radius (uint8, radius * 10) — compute server-side
+        // Opacity
+        _colScalar[sOff++] = Math.max(0, Math.min(255, Math.round(p.drawOpacity * 255)));
+
+        // Radius
         let radius;
         if (p.isCapillary) {
-            let c = Math.floor(p.x / GRID_SIZE);
-            let r = Math.floor(p.y / GRID_SIZE);
-            let capW = (c >= 0 && c < cols && r >= 0 && r < rows) ? capWetnessGrid[c + r * cols] : 0;
-            let thickness = Math.min(capW / CAP_THICKNESS_DIVISOR, 1.0);
+            const c = Math.floor(p.x / GRID_SIZE);
+            const r = Math.floor(p.y / GRID_SIZE);
+            const capW = (c >= 0 && c < cols && r >= 0 && r < rows) ? capWetnessGrid[c + r * cols] : 0;
+            const thickness = Math.min(capW / CAP_THICKNESS_DIVISOR, 1.0);
             radius = CAP_MIN_RADIUS + thickness * (CAPILLARY_MAX_RADIUS - CAP_MIN_RADIUS);
         } else {
             radius = p.weight * PARTICLE_RADIUS_SCALE * Math.sin((p.age / p.life) * Math.PI);
             if (p.inDelta) radius = Math.max(radius, DELTA_MIN_RADIUS);
         }
-        const radiusEnc = Math.max(0, Math.min(255, Math.round(radius * 10)));
-        buf.writeUInt8(radiusEnc, offset++);
+        _colScalar[sOff++] = Math.max(0, Math.min(255, Math.round(radius * 10)));
 
-        // sourceIdx (uint8)
-        buf.writeUInt8(p.sourceIdx & 0xFF, offset++);
+        // sourceIdx
+        _colScalar[sOff++] = p.sourceIdx & 0xFF;
 
-        // flags (uint8): bit 0 = isCapillary
-        buf.writeUInt8(p.isCapillary ? 1 : 0, offset++);
+        // flags: bit 0 = isCapillary
+        _colScalar[sOff++] = p.isCapillary ? 1 : 0;
+
+        activeCount++;
     }
 
-    return buf;
+    // Write 9-byte header into output buffer
+    _frameBuf[0] = 0x03;
+    _frameBuf[1] =  frameNum        & 0xFF;
+    _frameBuf[2] = (frameNum >>> 8)  & 0xFF;
+    _frameBuf[3] = (frameNum >>> 16) & 0xFF;
+    _frameBuf[4] = (frameNum >>> 24) & 0xFF;
+    _frameBuf[5] =  activeCount        & 0xFF;
+    _frameBuf[6] = (activeCount >>> 8)  & 0xFF;
+    _frameBuf[7] = (activeCount >>> 16) & 0xFF;
+    _frameBuf[8] = (activeCount >>> 24) & 0xFF;
+
+    // Copy columns sequentially after header
+    let out = 9;
+    _frameBuf.set(_colX.subarray(0, xOff), out);      out += xOff;
+    _frameBuf.set(_colY.subarray(0, yOff), out);      out += yOff;
+    _frameBuf.set(_colScalar.subarray(0, sOff), out); out += sOff;
+
+    // Return a Node.js Buffer view (zero-copy) over the filled slice
+    return Buffer.from(_frameBuf.buffer, _frameBuf.byteOffset, out);
 }
 
 // Pack a wetness or erosion grid into a compact binary Buffer.
@@ -1206,6 +1245,8 @@ function reset() {
     zOff = 0;
     frameNum = 0;
     simSpeedAccum = 0;
+    _prevX.fill(0);
+    _prevY.fill(0);
     recycledCapillaryCount = 0;
     wetnessGrid.fill(0);
     erosionGrid.fill(0);

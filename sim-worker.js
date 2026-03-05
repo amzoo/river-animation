@@ -21,9 +21,14 @@ sim.init();
 let frameCount = 0;
 let wetnessOverlay = false;
 let erosionOverlay = false;
+let running = true;
 
 parentPort.on('message', (msg) => {
-    if (msg.type === 'key') {
+    if (msg.type === 'pause') {
+        running = false;
+    } else if (msg.type === 'resume') {
+        running = true;
+    } else if (msg.type === 'key') {
         sim.handleKey(msg.key);
         // Report updated speed after speed-change keys so main thread can broadcast it
         if (msg.key === 'ArrowUp' || msg.key === 'ArrowDown') {
@@ -41,6 +46,7 @@ parentPort.on('message', (msg) => {
 });
 
 setInterval(() => {
+    if (!running) return;
     sim.tick();
 
     // Transfer particle frame (zero-copy: transfer the underlying ArrayBuffer)

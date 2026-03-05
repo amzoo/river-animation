@@ -129,8 +129,13 @@ function sendCurrentState(ws) {
 }
 
 wss.on('connection', (ws) => {
+    const wasEmpty = clients.size === 0;
     clients.add(ws);
     console.log(`Client connected. Total: ${clients.size}`);
+    if (wasEmpty) {
+        worker.postMessage({ type: 'resume' });
+        console.log('Sim resumed.');
+    }
     sendCurrentState(ws);
 
     ws.on('message', (data, isBinary) => {
@@ -200,6 +205,10 @@ wss.on('connection', (ws) => {
         }
         clients.delete(ws);
         console.log(`Client disconnected. Total: ${clients.size}`);
+        if (clients.size === 0) {
+            worker.postMessage({ type: 'pause' });
+            console.log('Sim paused.');
+        }
     });
 
     ws.on('error', (err) => console.error('WS client error:', err.message));

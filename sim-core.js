@@ -225,7 +225,6 @@ let capillaryOrigins = [];
 let sourceCentroids = [];
 let prevCapillaryOriginKeys = new Set();
 let recycledCapillaryCount = 0;
-let particles = [];
 let sourcePoints = [];
 let deltaParticleCount = 0;
 let riverZoneParticleCount = 0;
@@ -233,6 +232,43 @@ let frameDiversions = 0;
 let capillaryDiversion = false;
 let mixSources = true;
 let frameNum = 0;
+
+// ==========================================
+// Structure-of-Arrays (SoA) particle storage
+// ==========================================
+// Float32 arrays for continuous properties
+let px_arr;       // x position
+let py_arr;       // y position
+let vx_arr;       // x velocity
+let vy_arr;       // y velocity
+let speed_arr;    // per-particle speed scalar
+let weight_arr;   // per-particle weight
+let gravity_arr;  // per-particle gravity
+let life_arr;     // particle lifetime
+let age_arr;      // current age
+let opacity_arr;  // drawOpacity
+let stagnation_arr; // stagnation counter
+// Capillary-specific float arrays
+let capOriginX_arr;     // capillaryOriginX
+let capOriginY_arr;     // capillaryOriginY
+let capAngle_arr;       // capillaryAngle
+let capWiggleSeed_arr;  // capillaryWiggleSeed
+let capWiggleFreq_arr;  // capillaryWiggleFreq
+
+// Uint8 arrays for small integer / flag properties
+let sourceIdx_arr; // source index (0..NUM_SOURCES-1)
+// flags byte: bit0=isCapillary, bit1=isSource, bit2=inDelta, bit3=_recycled
+let flags_arr;
+// capillaryDir: stored as Uint8, 0=dir<0 (-1), 1=dir>=0 (+1)
+let capDir_arr;
+// streamId: small integer (0..NUM_SOURCES*2+1)
+let streamId_arr;
+
+// flag bit masks
+const FLAG_IS_CAPILLARY = 0x01;
+const FLAG_IS_SOURCE    = 0x02;
+const FLAG_IN_DELTA     = 0x04;
+const FLAG_RECYCLED     = 0x08;
 
 const simplex = new SimplexNoise();
 
@@ -293,26 +329,72 @@ function resize(w, h) {
     }
 }
 
+// Allocate all SoA arrays for N particles
+function _allocArrays(n) {
+    px_arr           = new Float32Array(n);
+    py_arr           = new Float32Array(n);
+    vx_arr           = new Float32Array(n);
+    vy_arr           = new Float32Array(n);
+    speed_arr        = new Float32Array(n);
+    weight_arr       = new Float32Array(n);
+    gravity_arr      = new Float32Array(n);
+    life_arr         = new Float32Array(n);
+    age_arr          = new Float32Array(n);
+    opacity_arr      = new Float32Array(n);
+    stagnation_arr   = new Float32Array(n);
+    capOriginX_arr   = new Float32Array(n);
+    capOriginY_arr   = new Float32Array(n);
+    capAngle_arr     = new Float32Array(n);
+    capWiggleSeed_arr = new Float32Array(n);
+    capWiggleFreq_arr = new Float32Array(n);
+    sourceIdx_arr    = new Uint8Array(n);
+    flags_arr        = new Uint8Array(n);
+    capDir_arr       = new Uint8Array(n);
+    streamId_arr     = new Uint8Array(n);
+}
+
+// Reset particle i to a new river-zone particle (non-capillary, non-source reset)
+function _resetParticle(i) {
+    const srcI = Math.floor(Math.random() * sourcePoints.length);
+    const src = sourcePoints[srcI];
+    sourceIdx_arr[i] = srcI;
+    px_arr[i] = src + (Math.random() - 0.5) * DELTA_SPAWN_WIDTH;
+    py_arr[i] = -Math.random() * SOURCE_SPAWN_HEIGHT;
+    vx_arr[i] = 0;
+    vy_arr[i] = 0;
+    speed_arr[i]   = Math.random() * PARTICLE_SPEED_VAR + PARTICLE_SPEED_BASE;
+    weight_arr[i]  = Math.random() * PARTICLE_WEIGHT_VAR + PARTICLE_WEIGHT_BASE;
+    gravity_arr[i] = Math.random() * PARTICLE_GRAVITY_VAR + PARTICLE_GRAVITY_BASE;
+    life_arr[i]    = Math.random() * PARTICLE_LIFE_VAR + PARTICLE_LIFE_BASE;
+    age_arr[i]     = 0;
+    opacity_arr[i] = 0;
+    stagnation_arr[i] = 0;
+    // preserve isSource / isCapillary flags; clear inDelta and recycled
+    flags_arr[i] &= (FLAG_IS_SOURCE | FLAG_IS_CAPILLARY);
+    flags_arr[i] &= ~FLAG_IN_DELTA;
+}
+
 function init() {
-    particles = [];
+    _allocArrays(NUM_PARTICLES);
     const SOURCE_COUNT = SOURCE_PARTICLE_COUNT;
     for (let i = 0; i < NUM_PARTICLES; i++) {
-        let p = new Particle();
-        p.isCapillary = false;
-        p.isSource = i < SOURCE_COUNT;
-        particles.push(p);
+        flags_arr[i] = 0;
+        if (i < SOURCE_COUNT) flags_arr[i] |= FLAG_IS_SOURCE;
+        _resetParticle(i);
+        // Spread initial particles vertically so they don't all bunch at the top
+        py_arr[i] = -Math.random() * height * DELTA_ZONE_END;
     }
 }
 
-// Distance from point (px,py) to the push arc pill shape
-function pushArcDist(px, py) {
+// Distance from point (ppx,ppy) to the push arc pill shape
+function pushArcDist(ppx, ppy) {
     let angle = mouse.pushAngle;
     let dirX = Math.cos(angle);
     let dirY = Math.sin(angle);
     let acx = mouse.x - dirX * PUSH_ARC_RADIUS;
     let acy = mouse.y - dirY * PUSH_ARC_RADIUS;
-    let dx = px - acx;
-    let dy = py - acy;
+    let dx = ppx - acx;
+    let dy = ppy - acy;
     let ptAngle = Math.atan2(dy, dx);
     let midAngle = Math.atan2(dirY, dirX);
     let half = PUSH_ARC_SPAN * 0.5;
@@ -323,377 +405,364 @@ function pushArcDist(px, py) {
     let clampedAngle = midAngle + diff;
     let nearX = acx + PUSH_ARC_RADIUS * Math.cos(clampedAngle);
     let nearY = acy + PUSH_ARC_RADIUS * Math.sin(clampedAngle);
-    let ndx = px - nearX;
-    let ndy = py - nearY;
+    let ndx = ppx - nearX;
+    let ndy = ppy - nearY;
     return Math.sqrt(ndx * ndx + ndy * ndy);
 }
 
-class Particle {
-    constructor() {
-        this._recycled = false;
-        this.reset();
-        // Spread initial particles vertically so they don't all bunch at the top
-        this.y = -Math.random() * height * DELTA_ZONE_END;
+// Recycle a capillary particle (find nearest origin or revert to river particle)
+function _recycleCapillary(i) {
+    const isRecycled = (flags_arr[i] & FLAG_RECYCLED) !== 0;
+    if (isRecycled) recycledCapillaryCount--;
+
+    let bestDist2 = Infinity, bestOrigin = null;
+    const mySrcIdx = sourceIdx_arr[i];
+    const myOriginX = capOriginX_arr[i];
+    const myOriginY = capOriginY_arr[i];
+    for (let o of capillaryOrigins) {
+        if (o.sourceIdx !== mySrcIdx) continue;
+        let dx = o.x - myOriginX;
+        let dy = o.y - myOriginY;
+        let d2 = dx * dx + dy * dy;
+        if (d2 < bestDist2) { bestDist2 = d2; bestOrigin = o; }
     }
-
-    reset() {
-        const srcI = Math.floor(Math.random() * sourcePoints.length);
-        const src = sourcePoints[srcI];
-        this.sourceIdx = srcI;
-        this.x = src + (Math.random() - 0.5) * DELTA_SPAWN_WIDTH;
-        this.y = -Math.random() * SOURCE_SPAWN_HEIGHT;
-        if (this.isSource) this.age = 0;
-        this.vx = 0;
-        this.vy = 0;
-        this.speed = Math.random() * PARTICLE_SPEED_VAR + PARTICLE_SPEED_BASE;
-        this.weight = Math.random() * PARTICLE_WEIGHT_VAR + PARTICLE_WEIGHT_BASE;
-        this.gravity = Math.random() * PARTICLE_GRAVITY_VAR + PARTICLE_GRAVITY_BASE;
-        this.life = Math.random() * PARTICLE_LIFE_VAR + PARTICLE_LIFE_BASE;
-        this.age = 0;
-        this.drawOpacity = 0;
-        this.stagnation = 0;
+    if (!bestOrigin || recycledCapillaryCount >= MAX_RECYCLED_CAPILLARIES) {
+        flags_arr[i] &= ~(FLAG_IS_CAPILLARY | FLAG_RECYCLED);
+        _resetParticle(i);
+        return;
     }
+    recycledCapillaryCount++;
+    flags_arr[i] |= FLAG_RECYCLED;
+    px_arr[i] = bestOrigin.x;
+    py_arr[i] = bestOrigin.y;
+    capOriginX_arr[i] = bestOrigin.x;
+    capOriginY_arr[i] = bestOrigin.y;
+    capAngle_arr[i] = bestOrigin.targetAngle;
+    capDir_arr[i] = Math.cos(bestOrigin.targetAngle) >= 0 ? 1 : 0;
+    age_arr[i] = 0;
+    capWiggleSeed_arr[i] = Math.random() * Math.PI * 2;
+    opacity_arr[i] = 0;
 
-    update() {
-        if (this.isCapillary) { this._updateCapillary(); return; }
-
-        const [forceX0, forceY0] = noiseGrid.sample(this.x, this.y);
-        let forceX = forceX0;
-        let forceY = forceY0;
-
-        let gradLen = Math.sqrt(forceX * forceX + forceY * forceY) || 1;
-        forceX /= gradLen;
-        forceY /= gradLen;
-
-        let c = Math.floor(this.x / GRID_SIZE);
-        let r = Math.floor(this.y / GRID_SIZE);
-        let cellWetness = 0;
-
-        if (c >= 0 && c < cols && r >= 0 && r < rows) {
-            let idx = c + r * cols;
-            wetnessGrid[idx] += WETNESS_DEPOSIT;
-            sourceOwnerGrid[idx] = this.sourceIdx;
-            cellWetness = wetnessGrid[idx];
-
-            if (erosionGrid[idx] < EROSION_MAX) {
-                erosionGrid[idx] += EROSION_DEPOSIT;
+    let oc = Math.floor(bestOrigin.x / GRID_SIZE);
+    let or_ = Math.floor(bestOrigin.y / GRID_SIZE);
+    let dir = capDir_arr[i] === 1 ? 1 : -1;
+    let bestPull = 0, bestDr = 0;
+    if (oc >= 0 && oc < cols && or_ >= 0 && or_ < rows) {
+        for (let s = 1; s <= CAP_SCAN_RADIUS; s++) {
+            let sc = oc + dir * s;
+            if (sc < 0 || sc >= cols) break;
+            for (let dr = -CAP_VERTICAL_SCAN; dr <= CAP_VERTICAL_SCAN; dr++) {
+                let sr = or_ + dr;
+                if (sr < 0 || sr >= rows) continue;
+                let w = capWetnessGrid[sc + sr * cols] + capErosionGrid[sc + sr * cols] * EROSION_WEIGHT;
+                if (w > bestPull) { bestPull = w; bestDr = dr; }
             }
-            let cellErosion = erosionGrid[idx];
-
-            let convergeFactor = Math.min(this.y / (height * CONVERGENCE_RAMP_RATIO), 1.0);
-            if (convergeFactor < 0) convergeFactor = 0;
-
-            if (convergeFactor > 0) {
-                let attractLeft = 0, attractRight = 0;
-                let repulseLeft = 0, repulseRight = 0;
-                let inPostTransition = this.y >= height * CONVERGENCE_RAMP_RATIO;
-
-                for (let s = 1; s <= STREAM_SCAN_RADIUS; s++) {
-                    if (c - s < 0) break;
-                    let w = wetnessGrid[idx - s] + erosionGrid[idx - s] * EROSION_WEIGHT;
-                    let distFalloff = 1.0 / (s * s);
-                    if (inPostTransition && sourceOwnerGrid[idx - s] >= 0
-                        && sourceOwnerGrid[idx - s] !== this.sourceIdx) {
-                        repulseLeft += w * distFalloff;
-                    } else {
-                        attractLeft += w * distFalloff;
-                    }
-                }
-
-                for (let s = 1; s <= STREAM_SCAN_RADIUS; s++) {
-                    if (c + s >= cols) break;
-                    let w = wetnessGrid[idx + s] + erosionGrid[idx + s] * EROSION_WEIGHT;
-                    let distFalloff = 1.0 / (s * s);
-                    if (inPostTransition && sourceOwnerGrid[idx + s] >= 0
-                        && sourceOwnerGrid[idx + s] !== this.sourceIdx) {
-                        repulseRight += w * distFalloff;
-                    } else {
-                        attractRight += w * distFalloff;
-                    }
-                }
-
-                let pullX = (attractRight - attractLeft);
-                let repulseX = mixSources ? 0 : (repulseLeft - repulseRight) * RIVER_REPULSE_STRENGTH;
-                let netX = pullX + repulseX;
-
-                let pullAbs = Math.abs(netX);
-                if (pullAbs > PULL_MIN_THRESHOLD) {
-                    let sign = netX > 0 ? 1 : -1;
-                    let attractStrength = Math.min(pullAbs * PULL_FORCE_SCALE, PULL_FORCE_MAX) * convergeFactor;
-                    let stagnationBoost = 1.0 + this.stagnation * STAGNATION_BOOST_RATE;
-                    attractStrength *= stagnationBoost;
-                    forceX += sign * attractStrength;
-                }
-            }
-
-            let erosionSpread = cellErosion * EROSION_SPREAD_STRENGTH;
-            forceX += (Math.random() - 0.5) * erosionSpread;
-
-            if (cellWetness > WETNESS_SPREAD_THRESHOLD) {
-                forceX += (Math.random() - 0.5) * Math.min(cellWetness * WETNESS_SPREAD_SCALE, WETNESS_SPREAD_MAX);
-            }
-        }
-
-        forceY += this.gravity + this.stagnation * 0.02;
-
-        if (this.y < height * CONVERGENCE_RAMP_RATIO) {
-            let topFactor = 1.0 - (this.y / (height * CONVERGENCE_RAMP_RATIO));
-            forceY += topFactor * TOP_PUSH_FORCE;
-        }
-
-        let edgeMargin = width * EDGE_MARGIN_RATIO;
-        if (this.x < edgeMargin) {
-            let edgeFactor = 1.0 - (this.x / edgeMargin);
-            forceX += edgeFactor * TOP_PUSH_FORCE;
-        } else if (this.x > width - edgeMargin) {
-            let edgeFactor = 1.0 - ((width - this.x) / edgeMargin);
-            forceX += -edgeFactor * TOP_PUSH_FORCE;
-        }
-
-        let length = Math.sqrt(forceX * forceX + forceY * forceY) || 1;
-        forceX /= length;
-        forceY /= length;
-
-        this.vx += forceX * FORCE_TO_VELOCITY * this.speed;
-        this.vy += forceY * FORCE_TO_VELOCITY * this.speed;
-
-        this.vx *= FRICTION;
-        this.vy *= FRICTION;
-
-        if (this.vy < 0) this.vy *= UPWARD_VELOCITY_DAMP;
-
-        let speed = Math.sqrt(this.vx * this.vx + this.vy * this.vy);
-        if (speed < STAGNATION_THRESHOLD) {
-            this.stagnation = Math.min(this.stagnation + 1, STAGNATION_MAX);
-        } else {
-            this.stagnation *= STAGNATION_DECAY;
-        }
-
-        this.x += this.vx;
-        this.y += this.vy;
-
-        // Mouse arc pill displacement (only active when server receives mouse events)
-        if (mouse.active && mouse.leftDown && (mouse.frameDX !== 0 || mouse.frameDY !== 0)) {
-            let dist = pushArcDist(this.x, this.y);
-            if (dist < PUSH_PILL_RADIUS) {
-                let falloff = 1.0 - dist / PUSH_PILL_RADIUS;
-                this.x += mouse.frameDX * falloff * MOUSE_PUSH_SCALE;
-                this.y += mouse.frameDY * falloff * MOUSE_PUSH_SCALE;
-                this.vx += mouse.frameDX * falloff * MOUSE_PUSH_VELOCITY;
-                this.vy += mouse.frameDY * falloff * MOUSE_PUSH_VELOCITY;
-            }
-        }
-
-        if (this.isSource && this.y > height * DELTA_ZONE_END) {
-            this.reset();
-            return;
-        }
-
-        let inDelta = this.y > 0 && this.y < height * DELTA_ZONE_END;
-        let inTransition = !inDelta && this.y >= height * DELTA_ZONE_END && this.y < height * TRANSITION_ZONE_END;
-        let transitionT = inTransition ? (this.y - height * DELTA_ZONE_END) / (height * (TRANSITION_ZONE_END - DELTA_ZONE_END)) : 1.0;
-        let inStream = cellWetness >= WETNESS_DRY_THRESHOLD;
-
-        if (!inStream && !inDelta && !inTransition && !this.isSource) {
-            this.age += STRAY_AGE_ACCEL;
-            let ageFade = 1.0 - Math.min(this.age / (this.life * STRAY_FADE_RATIO), 1.0);
-            this.drawOpacity = MAX_DRAW_OPACITY * STRAY_OPACITY_FACTOR * ageFade;
-        } else {
-            let ageRate = BASE_AGE_RATE;
-            if (inTransition && !inStream) {
-                ageRate = TRANSITION_AGE_BASE + transitionT * TRANSITION_AGE_RAMP;
-            }
-            this.age += ageRate;
-
-            let baseOpacity = Math.min(MAX_DRAW_OPACITY, cellWetness / 100);
-            if (inDelta) {
-                let deltaAge = Math.min(this.age / (this.life * DELTA_FADE_RATIO), 1.0);
-                let deltaFade = 1.0 - deltaAge * DELTA_FADE_STRENGTH;
-                baseOpacity = Math.max(baseOpacity, MAX_DRAW_OPACITY * deltaFade);
-            } else if (inTransition && !inStream) {
-                let deltaAge = Math.min(this.age / (this.life * DELTA_FADE_RATIO), 1.0);
-                let deltaFade = 1.0 - deltaAge * DELTA_FADE_STRENGTH;
-                let deltaOpacity = MAX_DRAW_OPACITY * deltaFade;
-                baseOpacity = Math.max(baseOpacity, deltaOpacity * (1.0 - transitionT));
-            }
-            this.drawOpacity = baseOpacity;
-        }
-        this.inDelta = inDelta || inTransition;
-
-        if (this.x < -OOB_MARGIN || this.x > width + OOB_MARGIN || this.y > height + OOB_MARGIN || this.age > this.life) {
-            this.reset();
         }
     }
+    if (bestPull > CAP_CHANNEL_THRESHOLD) {
+        let outX = Math.cos(bestOrigin.targetAngle);
+        let outY = Math.sin(bestOrigin.targetAngle);
+        vx_arr[i] = outX * CAPILLARY_LATERAL_FORCE * CAP_LATERAL_SCALE;
+        vy_arr[i] = outY * CAPILLARY_LATERAL_FORCE * CAP_LATERAL_SCALE + bestDr * CAP_ATTRACT_SCALE;
+    } else {
+        vx_arr[i] = 0;
+        vy_arr[i] = 0;
+    }
+}
 
-    _recycleCapillary() {
-        if (this._recycled) recycledCapillaryCount--;
+// Update a capillary particle (inline of former _updateCapillary method)
+function _updateCapillary(i) {
+    age_arr[i]++;
+    const age = age_arr[i];
 
-        let bestDist2 = Infinity, bestOrigin = null;
-        for (let o of capillaryOrigins) {
-            if (o.sourceIdx !== this.sourceIdx) continue;
-            let dx = o.x - this.capillaryOriginX;
-            let dy = o.y - this.capillaryOriginY;
-            let d2 = dx * dx + dy * dy;
-            if (d2 < bestDist2) { bestDist2 = d2; bestOrigin = o; }
-        }
-        if (!bestOrigin || recycledCapillaryCount >= MAX_RECYCLED_CAPILLARIES) {
-            this.isCapillary = false;
-            this._recycled = false;
-            this.reset();
-            return;
-        }
-        recycledCapillaryCount++;
-        this._recycled = true;
-        this.x = bestOrigin.x;
-        this.y = bestOrigin.y;
-        this.capillaryOriginX = bestOrigin.x;
-        this.capillaryOriginY = bestOrigin.y;
-        this.capillaryAngle = bestOrigin.targetAngle;
-        this.capillaryDir = Math.cos(bestOrigin.targetAngle) >= 0 ? 1 : -1;
-        this.age = 0;
-        this.capillaryWiggleSeed = Math.random() * Math.PI * 2;
-        this.drawOpacity = 0;
-
-        let oc = Math.floor(bestOrigin.x / GRID_SIZE);
-        let or_ = Math.floor(bestOrigin.y / GRID_SIZE);
-        let dir = this.capillaryDir;
-        let bestPull = 0, bestDr = 0;
-        if (oc >= 0 && oc < cols && or_ >= 0 && or_ < rows) {
-            for (let s = 1; s <= CAP_SCAN_RADIUS; s++) {
-                let sc = oc + dir * s;
-                if (sc < 0 || sc >= cols) break;
-                for (let dr = -CAP_VERTICAL_SCAN; dr <= CAP_VERTICAL_SCAN; dr++) {
-                    let sr = or_ + dr;
-                    if (sr < 0 || sr >= rows) continue;
-                    let w = capWetnessGrid[sc + sr * cols] + capErosionGrid[sc + sr * cols] * EROSION_WEIGHT;
-                    if (w > bestPull) { bestPull = w; bestDr = dr; }
-                }
-            }
-        }
-        if (bestPull > CAP_CHANNEL_THRESHOLD) {
-            let outX = Math.cos(bestOrigin.targetAngle);
-            let outY = Math.sin(bestOrigin.targetAngle);
-            this.vx = outX * CAPILLARY_LATERAL_FORCE * CAP_LATERAL_SCALE;
-            this.vy = outY * CAPILLARY_LATERAL_FORCE * CAP_LATERAL_SCALE + bestDr * CAP_ATTRACT_SCALE;
-        } else {
-            this.vx = 0;
-            this.vy = 0;
-        }
+    let wiggle = Math.sin(age * capWiggleFreq_arr[i] + capWiggleSeed_arr[i]) * CAPILLARY_WIGGLE_STRENGTH;
+    let spd2 = vx_arr[i] * vx_arr[i] + vy_arr[i] * vy_arr[i];
+    if (spd2 > 0.01) {
+        let inv = 1.0 / Math.sqrt(spd2);
+        let perpX = -vy_arr[i] * inv;
+        let perpY =  vx_arr[i] * inv;
+        vx_arr[i] += perpX * wiggle;
+        vy_arr[i] += perpY * wiggle;
+    } else {
+        vy_arr[i] += wiggle;
     }
 
-    _updateCapillary() {
-        this.age++;
+    let dx0 = px_arr[i] - capOriginX_arr[i];
+    let dy0 = py_arr[i] - capOriginY_arr[i];
+    let dist = Math.sqrt(dx0 * dx0 + dy0 * dy0);
+    let lateralFactor = Math.exp(-dist / CAP_LATERAL_DECAY_DIST);
+    let outX = Math.cos(capAngle_arr[i]);
+    let outY = Math.sin(capAngle_arr[i]);
+    vx_arr[i] += outX * CAPILLARY_LATERAL_FORCE * CAP_LATERAL_SCALE * lateralFactor;
+    vy_arr[i] += outY * CAPILLARY_LATERAL_FORCE * CAP_LATERAL_SCALE * lateralFactor;
 
-        let wiggle = Math.sin(this.age * this.capillaryWiggleFreq + this.capillaryWiggleSeed) * CAPILLARY_WIGGLE_STRENGTH;
-        let spd2 = this.vx * this.vx + this.vy * this.vy;
-        if (spd2 > 0.01) {
-            let inv = 1.0 / Math.sqrt(spd2);
-            let px = -this.vy * inv;
-            let py =  this.vx * inv;
-            this.vx += px * wiggle;
-            this.vy += py * wiggle;
-        } else {
-            this.vy += wiggle;
+    vy_arr[i] += CAPILLARY_GRAVITY;
+
+    let c = Math.floor(px_arr[i] / GRID_SIZE);
+    let r = Math.floor(py_arr[i] / GRID_SIZE);
+    if (c >= 0 && c < cols && r >= 0 && r < rows) {
+        let idx = c + r * cols;
+
+        capWetnessGrid[idx] += CAP_WETNESS_DEPOSIT;
+        if (capErosionGrid[idx] < CAP_EROSION_MAX) {
+            capErosionGrid[idx] += CAP_EROSION_DEPOSIT;
         }
 
-        let dx0 = this.x - this.capillaryOriginX;
-        let dy0 = this.y - this.capillaryOriginY;
-        let dist = Math.sqrt(dx0 * dx0 + dy0 * dy0);
-        let lateralFactor = Math.exp(-dist / CAP_LATERAL_DECAY_DIST);
-        let outX = Math.cos(this.capillaryAngle);
-        let outY = Math.sin(this.capillaryAngle);
-        this.vx += outX * CAPILLARY_LATERAL_FORCE * CAP_LATERAL_SCALE * lateralFactor;
-        this.vy += outY * CAPILLARY_LATERAL_FORCE * CAP_LATERAL_SCALE * lateralFactor;
-
-        this.vy += CAPILLARY_GRAVITY;
-
-        let c = Math.floor(this.x / GRID_SIZE);
-        let r = Math.floor(this.y / GRID_SIZE);
-        if (c >= 0 && c < cols && r >= 0 && r < rows) {
-            let idx = c + r * cols;
-
-            capWetnessGrid[idx] += CAP_WETNESS_DEPOSIT;
-            if (capErosionGrid[idx] < CAP_EROSION_MAX) {
-                capErosionGrid[idx] += CAP_EROSION_DEPOSIT;
+        let deposit = CAP_WETNESS_DEPOSIT + CAP_EROSION_DEPOSIT;
+        let sid = streamId_arr[i];
+        if (capOwnerStr[idx] < deposit || capOwnerGrid[idx] === sid) {
+            capOwnerGrid[idx] = sid;
+            capOwnerStr[idx] += deposit;
+        } else if (capOwnerGrid[idx] !== sid) {
+            capOwnerStr[idx] -= deposit * 0.5;
+            if (capOwnerStr[idx] <= 0) {
+                capOwnerGrid[idx] = sid;
+                capOwnerStr[idx] = deposit;
             }
+        }
+        let cellCapErosion = capErosionGrid[idx];
 
-            let deposit = CAP_WETNESS_DEPOSIT + CAP_EROSION_DEPOSIT;
-            if (capOwnerStr[idx] < deposit || capOwnerGrid[idx] === this.streamId) {
-                capOwnerGrid[idx] = this.streamId;
-                capOwnerStr[idx] += deposit;
-            } else if (capOwnerGrid[idx] !== this.streamId) {
-                capOwnerStr[idx] -= deposit * 0.5;
-                if (capOwnerStr[idx] <= 0) {
-                    capOwnerGrid[idx] = this.streamId;
-                    capOwnerStr[idx] = deposit;
-                }
-            }
-            let cellCapErosion = capErosionGrid[idx];
-
-            let pullY = 0;
-            let dir = this.capillaryDir > 0 ? 1 : -1;
-            for (let s = 1; s <= CAP_SCAN_RADIUS; s++) {
-                let sc = c + dir * s;
-                if (sc < 0 || sc >= cols) break;
-                for (let dr = -CAP_VERTICAL_SCAN; dr <= CAP_VERTICAL_SCAN; dr++) {
-                    let sr = r + dr;
-                    if (sr < 0 || sr >= rows) continue;
-                    let scanIdx = sc + sr * cols;
-                    let w = capWetnessGrid[scanIdx] + capErosionGrid[scanIdx] * EROSION_WEIGHT;
-                    if (w > CAP_CHANNEL_THRESHOLD) {
-                        let owner = capOwnerGrid[scanIdx];
-                        if (owner === 0 || owner === this.streamId) {
-                            pullY += dr * w * CAP_ATTRACT_SCALE / (s * s);
-                        }
+        let pullY = 0;
+        let dir = capDir_arr[i] === 1 ? 1 : -1;
+        for (let s = 1; s <= CAP_SCAN_RADIUS; s++) {
+            let sc = c + dir * s;
+            if (sc < 0 || sc >= cols) break;
+            for (let dr = -CAP_VERTICAL_SCAN; dr <= CAP_VERTICAL_SCAN; dr++) {
+                let sr = r + dr;
+                if (sr < 0 || sr >= rows) continue;
+                let scanIdx = sc + sr * cols;
+                let w = capWetnessGrid[scanIdx] + capErosionGrid[scanIdx] * EROSION_WEIGHT;
+                if (w > CAP_CHANNEL_THRESHOLD) {
+                    let owner = capOwnerGrid[scanIdx];
+                    if (owner === 0 || owner === sid) {
+                        pullY += dr * w * CAP_ATTRACT_SCALE / (s * s);
                     }
                 }
             }
-            this.vy += pullY;
-
-            let erosionSpread = cellCapErosion * CAP_EROSION_SPREAD;
-            this.vx += (Math.random() - 0.5) * erosionSpread;
         }
+        vy_arr[i] += pullY;
 
-        this.vx *= CAP_FRICTION;
-        this.vy *= CAP_FRICTION;
-        let spd = Math.sqrt(this.vx * this.vx + this.vy * this.vy);
-        if (spd > CAP_MAX_SPEED) {
-            this.vx = (this.vx / spd) * CAP_MAX_SPEED;
-            this.vy = (this.vy / spd) * CAP_MAX_SPEED;
+        let erosionSpread = cellCapErosion * CAP_EROSION_SPREAD;
+        vx_arr[i] += (Math.random() - 0.5) * erosionSpread;
+    }
+
+    vx_arr[i] *= CAP_FRICTION;
+    vy_arr[i] *= CAP_FRICTION;
+    let spd = Math.sqrt(vx_arr[i] * vx_arr[i] + vy_arr[i] * vy_arr[i]);
+    if (spd > CAP_MAX_SPEED) {
+        vx_arr[i] = (vx_arr[i] / spd) * CAP_MAX_SPEED;
+        vy_arr[i] = (vy_arr[i] / spd) * CAP_MAX_SPEED;
+    }
+
+    px_arr[i] += vx_arr[i];
+    py_arr[i] += vy_arr[i];
+
+    // Mouse arc pill displacement (only active when server receives mouse events)
+    if (mouse.active && mouse.leftDown && (mouse.frameDX !== 0 || mouse.frameDY !== 0)) {
+        let mdist = pushArcDist(px_arr[i], py_arr[i]);
+        if (mdist < PUSH_PILL_RADIUS) {
+            let falloff = 1.0 - mdist / PUSH_PILL_RADIUS;
+            px_arr[i] += mouse.frameDX * falloff * MOUSE_PUSH_SCALE;
+            py_arr[i] += mouse.frameDY * falloff * MOUSE_PUSH_SCALE;
         }
+    }
 
-        this.x += this.vx;
-        this.y += this.vy;
+    let fadeIn = Math.min(age / CAP_FADE_IN_FRAMES, 1.0);
+    opacity_arr[i] = CAPILLARY_MAX_OPACITY * fadeIn;
 
-        // Mouse arc pill displacement (only active when server receives mouse events)
-        if (mouse.active && mouse.leftDown && (mouse.frameDX !== 0 || mouse.frameDY !== 0)) {
-            let dist = pushArcDist(this.x, this.y);
-            if (dist < PUSH_PILL_RADIUS) {
-                let falloff = 1.0 - dist / PUSH_PILL_RADIUS;
-                this.x += mouse.frameDX * falloff * MOUSE_PUSH_SCALE;
-                this.y += mouse.frameDY * falloff * MOUSE_PUSH_SCALE;
+    if (age > CAP_FADE_IN_FRAMES) {
+        let rzYStart = Math.floor(height * TRANSITION_ZONE_END);
+        let rr = Math.floor((py_arr[i] - rzYStart) / RIVER_CELL_SIZE);
+        let rc = Math.floor(px_arr[i] / RIVER_CELL_SIZE);
+        if (rr >= 0 && rr < riverGridRows && rc >= 0 && rc < riverGridCols) {
+            let lbl = riverLabels[rr * riverGridCols + rc];
+            if (lbl > 0) {
+                _recycleCapillary(i);
+                return;
             }
         }
+    }
 
-        let fadeIn = Math.min(this.age / CAP_FADE_IN_FRAMES, 1.0);
-        this.drawOpacity = CAPILLARY_MAX_OPACITY * fadeIn;
+    if (px_arr[i] < -OOB_MARGIN || px_arr[i] > width + OOB_MARGIN ||
+        py_arr[i] < -OOB_MARGIN || py_arr[i] > height + OOB_MARGIN) {
+        _recycleCapillary(i);
+    }
+}
 
-        if (this.age > CAP_FADE_IN_FRAMES) {
-            let rzYStart = Math.floor(height * TRANSITION_ZONE_END);
-            let rr = Math.floor((this.y - rzYStart) / RIVER_CELL_SIZE);
-            let rc = Math.floor(this.x / RIVER_CELL_SIZE);
-            if (rr >= 0 && rr < riverGridRows && rc >= 0 && rc < riverGridCols) {
-                let lbl = riverLabels[rr * riverGridCols + rc];
-                if (lbl > 0) {
-                    this._recycleCapillary();
-                    return;
+// Update a river/delta particle (inline of former update method)
+function _updateRiver(i) {
+    const [forceX0, forceY0] = noiseGrid.sample(px_arr[i], py_arr[i]);
+    let forceX = forceX0;
+    let forceY = forceY0;
+
+    let gradLen = Math.sqrt(forceX * forceX + forceY * forceY) || 1;
+    forceX /= gradLen;
+    forceY /= gradLen;
+
+    let c = Math.floor(px_arr[i] / GRID_SIZE);
+    let r = Math.floor(py_arr[i] / GRID_SIZE);
+    let cellWetness = 0;
+
+    if (c >= 0 && c < cols && r >= 0 && r < rows) {
+        let idx = c + r * cols;
+        wetnessGrid[idx] += WETNESS_DEPOSIT;
+        sourceOwnerGrid[idx] = sourceIdx_arr[i];
+        cellWetness = wetnessGrid[idx];
+
+        if (erosionGrid[idx] < EROSION_MAX) {
+            erosionGrid[idx] += EROSION_DEPOSIT;
+        }
+        let cellErosion = erosionGrid[idx];
+
+        let convergeFactor = Math.min(py_arr[i] / (height * CONVERGENCE_RAMP_RATIO), 1.0);
+        if (convergeFactor < 0) convergeFactor = 0;
+
+        if (convergeFactor > 0) {
+            let attractLeft = 0, attractRight = 0;
+            let repulseLeft = 0, repulseRight = 0;
+            let inPostTransition = py_arr[i] >= height * CONVERGENCE_RAMP_RATIO;
+
+            for (let s = 1; s <= STREAM_SCAN_RADIUS; s++) {
+                if (c - s < 0) break;
+                let w = wetnessGrid[idx - s] + erosionGrid[idx - s] * EROSION_WEIGHT;
+                let distFalloff = 1.0 / (s * s);
+                if (inPostTransition && sourceOwnerGrid[idx - s] >= 0
+                    && sourceOwnerGrid[idx - s] !== sourceIdx_arr[i]) {
+                    repulseLeft += w * distFalloff;
+                } else {
+                    attractLeft += w * distFalloff;
                 }
             }
+
+            for (let s = 1; s <= STREAM_SCAN_RADIUS; s++) {
+                if (c + s >= cols) break;
+                let w = wetnessGrid[idx + s] + erosionGrid[idx + s] * EROSION_WEIGHT;
+                let distFalloff = 1.0 / (s * s);
+                if (inPostTransition && sourceOwnerGrid[idx + s] >= 0
+                    && sourceOwnerGrid[idx + s] !== sourceIdx_arr[i]) {
+                    repulseRight += w * distFalloff;
+                } else {
+                    attractRight += w * distFalloff;
+                }
+            }
+
+            let pullX = (attractRight - attractLeft);
+            let repulseX = mixSources ? 0 : (repulseLeft - repulseRight) * RIVER_REPULSE_STRENGTH;
+            let netX = pullX + repulseX;
+
+            let pullAbs = Math.abs(netX);
+            if (pullAbs > PULL_MIN_THRESHOLD) {
+                let sign = netX > 0 ? 1 : -1;
+                let attractStrength = Math.min(pullAbs * PULL_FORCE_SCALE, PULL_FORCE_MAX) * convergeFactor;
+                let stagnationBoost = 1.0 + stagnation_arr[i] * STAGNATION_BOOST_RATE;
+                attractStrength *= stagnationBoost;
+                forceX += sign * attractStrength;
+            }
         }
 
-        if (this.x < -OOB_MARGIN || this.x > width + OOB_MARGIN || this.y < -OOB_MARGIN || this.y > height + OOB_MARGIN) {
-            this._recycleCapillary();
+        let erosionSpread = erosionGrid[idx] * EROSION_SPREAD_STRENGTH;
+        forceX += (Math.random() - 0.5) * erosionSpread;
+
+        if (cellWetness > WETNESS_SPREAD_THRESHOLD) {
+            forceX += (Math.random() - 0.5) * Math.min(cellWetness * WETNESS_SPREAD_SCALE, WETNESS_SPREAD_MAX);
         }
+    }
+
+    forceY += gravity_arr[i] + stagnation_arr[i] * 0.02;
+
+    if (py_arr[i] < height * CONVERGENCE_RAMP_RATIO) {
+        let topFactor = 1.0 - (py_arr[i] / (height * CONVERGENCE_RAMP_RATIO));
+        forceY += topFactor * TOP_PUSH_FORCE;
+    }
+
+    let edgeMargin = width * EDGE_MARGIN_RATIO;
+    if (px_arr[i] < edgeMargin) {
+        let edgeFactor = 1.0 - (px_arr[i] / edgeMargin);
+        forceX += edgeFactor * TOP_PUSH_FORCE;
+    } else if (px_arr[i] > width - edgeMargin) {
+        let edgeFactor = 1.0 - ((width - px_arr[i]) / edgeMargin);
+        forceX += -edgeFactor * TOP_PUSH_FORCE;
+    }
+
+    let length = Math.sqrt(forceX * forceX + forceY * forceY) || 1;
+    forceX /= length;
+    forceY /= length;
+
+    vx_arr[i] += forceX * FORCE_TO_VELOCITY * speed_arr[i];
+    vy_arr[i] += forceY * FORCE_TO_VELOCITY * speed_arr[i];
+
+    vx_arr[i] *= FRICTION;
+    vy_arr[i] *= FRICTION;
+
+    if (vy_arr[i] < 0) vy_arr[i] *= UPWARD_VELOCITY_DAMP;
+
+    let spd = Math.sqrt(vx_arr[i] * vx_arr[i] + vy_arr[i] * vy_arr[i]);
+    if (spd < STAGNATION_THRESHOLD) {
+        stagnation_arr[i] = Math.min(stagnation_arr[i] + 1, STAGNATION_MAX);
+    } else {
+        stagnation_arr[i] *= STAGNATION_DECAY;
+    }
+
+    px_arr[i] += vx_arr[i];
+    py_arr[i] += vy_arr[i];
+
+    // Mouse arc pill displacement (only active when server receives mouse events)
+    if (mouse.active && mouse.leftDown && (mouse.frameDX !== 0 || mouse.frameDY !== 0)) {
+        let mdist = pushArcDist(px_arr[i], py_arr[i]);
+        if (mdist < PUSH_PILL_RADIUS) {
+            let falloff = 1.0 - mdist / PUSH_PILL_RADIUS;
+            px_arr[i] += mouse.frameDX * falloff * MOUSE_PUSH_SCALE;
+            py_arr[i] += mouse.frameDY * falloff * MOUSE_PUSH_SCALE;
+            vx_arr[i] += mouse.frameDX * falloff * MOUSE_PUSH_VELOCITY;
+            vy_arr[i] += mouse.frameDY * falloff * MOUSE_PUSH_VELOCITY;
+        }
+    }
+
+    const isSource = (flags_arr[i] & FLAG_IS_SOURCE) !== 0;
+    if (isSource && py_arr[i] > height * DELTA_ZONE_END) {
+        _resetParticle(i);
+        return;
+    }
+
+    let inDelta = py_arr[i] > 0 && py_arr[i] < height * DELTA_ZONE_END;
+    let inTransition = !inDelta && py_arr[i] >= height * DELTA_ZONE_END && py_arr[i] < height * TRANSITION_ZONE_END;
+    let transitionT = inTransition ? (py_arr[i] - height * DELTA_ZONE_END) / (height * (TRANSITION_ZONE_END - DELTA_ZONE_END)) : 1.0;
+    let inStream = cellWetness >= WETNESS_DRY_THRESHOLD;
+
+    if (!inStream && !inDelta && !inTransition && !isSource) {
+        age_arr[i] += STRAY_AGE_ACCEL;
+        let ageFade = 1.0 - Math.min(age_arr[i] / (life_arr[i] * STRAY_FADE_RATIO), 1.0);
+        opacity_arr[i] = MAX_DRAW_OPACITY * STRAY_OPACITY_FACTOR * ageFade;
+    } else {
+        let ageRate = BASE_AGE_RATE;
+        if (inTransition && !inStream) {
+            ageRate = TRANSITION_AGE_BASE + transitionT * TRANSITION_AGE_RAMP;
+        }
+        age_arr[i] += ageRate;
+
+        let baseOpacity = Math.min(MAX_DRAW_OPACITY, cellWetness / 100);
+        if (inDelta) {
+            let deltaAge = Math.min(age_arr[i] / (life_arr[i] * DELTA_FADE_RATIO), 1.0);
+            let deltaFade = 1.0 - deltaAge * DELTA_FADE_STRENGTH;
+            baseOpacity = Math.max(baseOpacity, MAX_DRAW_OPACITY * deltaFade);
+        } else if (inTransition && !inStream) {
+            let deltaAge = Math.min(age_arr[i] / (life_arr[i] * DELTA_FADE_RATIO), 1.0);
+            let deltaFade = 1.0 - deltaAge * DELTA_FADE_STRENGTH;
+            let deltaOpacity = MAX_DRAW_OPACITY * deltaFade;
+            baseOpacity = Math.max(baseOpacity, deltaOpacity * (1.0 - transitionT));
+        }
+        opacity_arr[i] = baseOpacity;
+    }
+
+    // Update inDelta flag bit
+    if (inDelta || inTransition) {
+        flags_arr[i] |= FLAG_IN_DELTA;
+    } else {
+        flags_arr[i] &= ~FLAG_IN_DELTA;
+    }
+
+    if (px_arr[i] < -OOB_MARGIN || px_arr[i] > width + OOB_MARGIN || py_arr[i] > height + OOB_MARGIN || age_arr[i] > life_arr[i]) {
+        _resetParticle(i);
     }
 }
 
@@ -707,13 +776,12 @@ function updateRiverGrid() {
     if (zoneH <= 0 || riverGridCols === 0 || riverGridRows === 0) return;
 
     let cellCounts = new Uint16Array(riverGridCols * riverGridRows);
-    for (let i = 0; i < particles.length; i++) {
-        let p = particles[i];
-        if (p.isCapillary || p.y < rzYStart) continue;
-        let r = Math.floor((p.y - rzYStart) / RIVER_CELL_SIZE);
-        let c = Math.floor(p.x / RIVER_CELL_SIZE);
-        if (r >= 0 && r < riverGridRows && c >= 0 && c < riverGridCols) {
-            cellCounts[r * riverGridCols + c]++;
+    for (let i = 0; i < NUM_PARTICLES; i++) {
+        if ((flags_arr[i] & FLAG_IS_CAPILLARY) !== 0 || py_arr[i] < rzYStart) continue;
+        let rr = Math.floor((py_arr[i] - rzYStart) / RIVER_CELL_SIZE);
+        let rc = Math.floor(px_arr[i] / RIVER_CELL_SIZE);
+        if (rr >= 0 && rr < riverGridRows && rc >= 0 && rc < riverGridCols) {
+            cellCounts[rr * riverGridCols + rc]++;
         }
     }
 
@@ -824,14 +892,15 @@ function updateRiverGrid() {
     let compSourceCounts = new Array(label);
     for (let i = 0; i < label; i++) compSourceCounts[i] = {};
 
-    for (let p of particles) {
-        let pr = Math.floor((p.y - rzYStart) / RIVER_CELL_SIZE);
-        let pc = Math.floor(p.x / RIVER_CELL_SIZE);
+    for (let i = 0; i < NUM_PARTICLES; i++) {
+        let pr = Math.floor((py_arr[i] - rzYStart) / RIVER_CELL_SIZE);
+        let pc = Math.floor(px_arr[i] / RIVER_CELL_SIZE);
         if (pr < 0 || pr >= riverGridRows || pc < 0 || pc >= riverGridCols) continue;
         let lbl = riverLabels[pr * riverGridCols + pc];
-        if (lbl > 0 && p.sourceIdx >= 0) {
+        if (lbl > 0) {
             let counts = compSourceCounts[lbl - 1];
-            counts[p.sourceIdx] = (counts[p.sourceIdx] || 0) + 1;
+            let sidx = sourceIdx_arr[i];
+            counts[sidx] = (counts[sidx] || 0) + 1;
         }
     }
 
@@ -988,10 +1057,9 @@ function tick() {
         let deltaEnd = height * DELTA_ZONE_END;
         deltaParticleCount = 0;
         riverZoneParticleCount = 0;
-        for (let i = 0; i < particles.length; i++) {
-            let p = particles[i];
-            if (p.y >= 0 && p.y < deltaEnd) deltaParticleCount++;
-            if (!p.isSource && p.y >= height * TRANSITION_ZONE_END) riverZoneParticleCount++;
+        for (let i = 0; i < NUM_PARTICLES; i++) {
+            if (py_arr[i] >= 0 && py_arr[i] < deltaEnd) deltaParticleCount++;
+            if ((flags_arr[i] & FLAG_IS_SOURCE) === 0 && py_arr[i] >= height * TRANSITION_ZONE_END) riverZoneParticleCount++;
         }
 
         updateRiverGrid();
@@ -1002,29 +1070,30 @@ function tick() {
         if (capillaryDiversion && capillaryOrigins.length > 0 &&
             riverZoneParticleCount > CAPILLARY_DIVERSION_THRESHOLD) {
             for (let d = 0; d < CAPILLARY_DIVERSIONS_PER_FRAME; d++) {
-                let idx = Math.floor(Math.random() * particles.length);
-                let p = particles[idx];
-                if (p.isSource || p.isCapillary || p.y < 0 || p.y >= deltaEnd) continue;
+                let idx = Math.floor(Math.random() * NUM_PARTICLES);
+                let f = flags_arr[idx];
+                if ((f & FLAG_IS_SOURCE) !== 0 || (f & FLAG_IS_CAPILLARY) !== 0 ||
+                    py_arr[idx] < 0 || py_arr[idx] >= deltaEnd) continue;
 
                 let o = capillaryOrigins[Math.floor(Math.random() * capillaryOrigins.length)];
-                p.isCapillary = true;
-                p.x = o.x;
-                p.y = o.y;
-                p.capillaryDir = Math.cos(o.targetAngle) >= 0 ? 1 : -1;
-                p.streamId = o.sourceIdx * 2 + (p.capillaryDir > 0 ? 1 : 0) + 1;
-                p.capillaryOriginX = o.x;
-                p.capillaryOriginY = o.y;
-                p.capillaryAngle = o.targetAngle;
-                p.sourceIdx = o.sourceIdx;
-                p.age = 0;
-                p.capillaryWiggleSeed = Math.random() * Math.PI * 2;
-                p.capillaryWiggleFreq = CAP_WIGGLE_FREQ_BASE + Math.random() * CAP_WIGGLE_FREQ_VAR;
-                p.drawOpacity = CAPILLARY_MAX_OPACITY;
-                p._recycled = false;
+                flags_arr[idx] |= FLAG_IS_CAPILLARY;
+                flags_arr[idx] &= ~FLAG_RECYCLED;
+                px_arr[idx] = o.x;
+                py_arr[idx] = o.y;
+                capDir_arr[idx] = Math.cos(o.targetAngle) >= 0 ? 1 : 0;
+                let dir = capDir_arr[idx] === 1 ? 1 : -1;
+                streamId_arr[idx] = (o.sourceIdx * 2 + (dir > 0 ? 1 : 0) + 1) & 0xFF;
+                capOriginX_arr[idx] = o.x;
+                capOriginY_arr[idx] = o.y;
+                capAngle_arr[idx] = o.targetAngle;
+                sourceIdx_arr[idx] = o.sourceIdx;
+                age_arr[idx] = 0;
+                capWiggleSeed_arr[idx] = Math.random() * Math.PI * 2;
+                capWiggleFreq_arr[idx] = CAP_WIGGLE_FREQ_BASE + Math.random() * CAP_WIGGLE_FREQ_VAR;
+                opacity_arr[idx] = CAPILLARY_MAX_OPACITY;
 
                 let oc = Math.floor(o.x / GRID_SIZE);
                 let or_ = Math.floor(o.y / GRID_SIZE);
-                let dir = p.capillaryDir;
                 let bestPull = 0, bestDr = 0;
                 if (oc >= 0 && oc < cols && or_ >= 0 && or_ < rows) {
                     for (let s = 1; s <= CAP_SCAN_RADIUS; s++) {
@@ -1041,11 +1110,11 @@ function tick() {
                 if (bestPull > CAP_CHANNEL_THRESHOLD) {
                     let outX = Math.cos(o.targetAngle);
                     let outY = Math.sin(o.targetAngle);
-                    p.vx = outX * CAPILLARY_LATERAL_FORCE * CAP_LATERAL_SCALE;
-                    p.vy = outY * CAPILLARY_LATERAL_FORCE * CAP_LATERAL_SCALE + bestDr * CAP_ATTRACT_SCALE;
+                    vx_arr[idx] = outX * CAPILLARY_LATERAL_FORCE * CAP_LATERAL_SCALE;
+                    vy_arr[idx] = outY * CAPILLARY_LATERAL_FORCE * CAP_LATERAL_SCALE + bestDr * CAP_ATTRACT_SCALE;
                 } else {
-                    p.vx = 0;
-                    p.vy = 0;
+                    vx_arr[idx] = 0;
+                    vy_arr[idx] = 0;
                 }
             }
         }
@@ -1054,8 +1123,12 @@ function tick() {
         // interpolate from it instead of calling fbm() 3× per particle.
         noiseGrid.build(fbm, NOISE_SCALE, NOISE_EPSILON, zOff);
 
-        for (let i = 0; i < particles.length; i++) {
-            particles[i].update();
+        for (let i = 0; i < NUM_PARTICLES; i++) {
+            if ((flags_arr[i] & FLAG_IS_CAPILLARY) !== 0) {
+                _updateCapillary(i);
+            } else {
+                _updateRiver(i);
+            }
         }
     }
 
@@ -1081,8 +1154,8 @@ function tick() {
 function getFrameData() {
     // Count visible particles
     let count = 0;
-    for (let i = 0; i < particles.length; i++) {
-        if (particles[i].drawOpacity > MIN_DRAW_OPACITY) count++;
+    for (let i = 0; i < NUM_PARTICLES; i++) {
+        if (opacity_arr[i] > MIN_DRAW_OPACITY) count++;
     }
 
     const buf = Buffer.allocUnsafe(1 + 8 + count * 8);
@@ -1091,42 +1164,42 @@ function getFrameData() {
     buf.writeUInt32LE(count, 5);
 
     let offset = 9;
-    for (let i = 0; i < particles.length; i++) {
-        const p = particles[i];
-        if (p.drawOpacity <= MIN_DRAW_OPACITY) continue;
+    for (let i = 0; i < NUM_PARTICLES; i++) {
+        if (opacity_arr[i] <= MIN_DRAW_OPACITY) continue;
 
         // x (uint16, normalized 0–65535 across simulation width)
-        const xEnc = Math.max(0, Math.min(65535, Math.round(p.x / width * 65535)));
+        const xEnc = Math.max(0, Math.min(65535, Math.round(px_arr[i] / width * 65535)));
         buf.writeUInt16LE(xEnc, offset); offset += 2;
 
         // y (uint16, normalized 0–65535 across simulation height)
-        const yEnc = Math.max(0, Math.min(65535, Math.round(p.y / height * 65535)));
+        const yEnc = Math.max(0, Math.min(65535, Math.round(py_arr[i] / height * 65535)));
         buf.writeUInt16LE(yEnc, offset); offset += 2;
 
         // opacity (uint8, opacity * 255)
-        const opacityEnc = Math.max(0, Math.min(255, Math.round(p.drawOpacity * 255)));
+        const opacityEnc = Math.max(0, Math.min(255, Math.round(opacity_arr[i] * 255)));
         buf.writeUInt8(opacityEnc, offset++);
 
         // radius (uint8, radius * 10) — compute server-side
         let radius;
-        if (p.isCapillary) {
-            let c = Math.floor(p.x / GRID_SIZE);
-            let r = Math.floor(p.y / GRID_SIZE);
+        const isCapillary = (flags_arr[i] & FLAG_IS_CAPILLARY) !== 0;
+        if (isCapillary) {
+            let c = Math.floor(px_arr[i] / GRID_SIZE);
+            let r = Math.floor(py_arr[i] / GRID_SIZE);
             let capW = (c >= 0 && c < cols && r >= 0 && r < rows) ? capWetnessGrid[c + r * cols] : 0;
             let thickness = Math.min(capW / CAP_THICKNESS_DIVISOR, 1.0);
             radius = CAP_MIN_RADIUS + thickness * (CAPILLARY_MAX_RADIUS - CAP_MIN_RADIUS);
         } else {
-            radius = p.weight * PARTICLE_RADIUS_SCALE * Math.sin((p.age / p.life) * Math.PI);
-            if (p.inDelta) radius = Math.max(radius, DELTA_MIN_RADIUS);
+            radius = weight_arr[i] * PARTICLE_RADIUS_SCALE * Math.sin((age_arr[i] / life_arr[i]) * Math.PI);
+            if ((flags_arr[i] & FLAG_IN_DELTA) !== 0) radius = Math.max(radius, DELTA_MIN_RADIUS);
         }
         const radiusEnc = Math.max(0, Math.min(255, Math.round(radius * 10)));
         buf.writeUInt8(radiusEnc, offset++);
 
         // sourceIdx (uint8)
-        buf.writeUInt8(p.sourceIdx & 0xFF, offset++);
+        buf.writeUInt8(sourceIdx_arr[i] & 0xFF, offset++);
 
         // flags (uint8): bit 0 = isCapillary
-        buf.writeUInt8(p.isCapillary ? 1 : 0, offset++);
+        buf.writeUInt8(isCapillary ? 1 : 0, offset++);
     }
 
     return buf;
@@ -1220,7 +1293,6 @@ function reset() {
     riverCellLastSeen.fill(0);
     capillaryOrigins = [];
     prevCapillaryOriginKeys = new Set();
-    particles = [];
     init();
     console.log('Simulation reset.');
 }

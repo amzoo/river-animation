@@ -148,7 +148,13 @@ const FORCE_TO_VELOCITY    = 0.2;
 const UPWARD_VELOCITY_DAMP = 0.1;
 const STAGNATION_THRESHOLD = 0.3;
 const STAGNATION_MAX       = 60;
+
 const STAGNATION_DECAY     = 0.95;
+
+// --- Particle Sleep/Wake (Stage 4) ---
+const SLEEP_THRESHOLD_VEL = 0.3; // speed below which a particle is a sleep candidate
+const WAKE_THRESHOLD_VEL  = 0.8; // noise magnitude that wakes a sleeping particle
+const SLEEP_FRAMES        = 5;   // frames below threshold before sleeping
 
 // --- Particle Aging & Opacity ---
 const STRAY_AGE_ACCEL       = 2;
@@ -292,6 +298,8 @@ let flags_arr;
 let capDir_arr;
 // streamId: small integer (0..NUM_SOURCES*2+1)
 let streamId_arr;
+// sleepCounter: frames spent below SLEEP_THRESHOLD_VEL; >= SLEEP_FRAMES means sleeping
+let sleepCounter_arr;
 
 // flag bit masks
 const FLAG_IS_CAPILLARY = 0x01;
@@ -381,6 +389,7 @@ function _allocArrays(n) {
     flags_arr        = new Uint8Array(n);
     capDir_arr       = new Uint8Array(n);
     streamId_arr     = new Uint8Array(n);
+    sleepCounter_arr = new Uint8Array(n);
 }
 
 // Reset particle i to a new river-zone particle (non-capillary, non-source reset)
@@ -399,6 +408,7 @@ function _resetParticle(i) {
     age_arr[i]     = 0;
     opacity_arr[i] = 0;
     stagnation_arr[i] = 0;
+    sleepCounter_arr[i] = 0;
     // preserve isSource / isCapillary flags; clear inDelta and recycled
     flags_arr[i] &= (FLAG_IS_SOURCE | FLAG_IS_CAPILLARY);
     flags_arr[i] &= ~FLAG_IN_DELTA;
@@ -1169,11 +1179,41 @@ function tick() {
         noiseGrid.build(fbm, NOISE_SCALE, NOISE_EPSILON, zOff);
 
         for (let i = 0; i < NUM_PARTICLES; i++) {
+            // Stage 4: sleep/wake system
+            if (sleepCounter_arr[i] >= SLEEP_FRAMES) {
+                // Particle is sleeping — check if noise field at its position has woken up
+                const [nx, ny] = noiseGrid.sample(px_arr[i], py_arr[i]);
+                const nmag = Math.sqrt(nx * nx + ny * ny);
+                if (nmag > WAKE_THRESHOLD_VEL) {
+                    sleepCounter_arr[i] = 0; // wake
+                } else {
+                    continue; // stay asleep, skip physics
+                }
+            }
+
             if ((flags_arr[i] & FLAG_IS_CAPILLARY) !== 0) {
                 _updateCapillary(i);
             } else {
                 _updateRiver(i);
             }
+
+            // Update sleep counter based on post-update speed
+            const spd = Math.sqrt(vx_arr[i] * vx_arr[i] + vy_arr[i] * vy_arr[i]);
+            if (spd < SLEEP_THRESHOLD_VEL) {
+                // Cap at 255 (Uint8 max); SLEEP_FRAMES is 5, so well within range
+                if (sleepCounter_arr[i] < 255) sleepCounter_arr[i]++;
+            } else {
+                sleepCounter_arr[i] = 0;
+            }
+        }
+
+        // Stage 4: log sleeping vs awake stats every 300 frames
+        if (frameNum % 300 === 0) {
+            let sleeping = 0;
+            for (let i = 0; i < NUM_PARTICLES; i++) {
+                if (sleepCounter_arr[i] >= SLEEP_FRAMES) sleeping++;
+            }
+            console.log(`[sleep] frame=${frameNum} sleeping=${sleeping} awake=${NUM_PARTICLES - sleeping} (${(sleeping / NUM_PARTICLES * 100).toFixed(1)}% asleep)`);
         }
     }
 
@@ -1339,6 +1379,7 @@ function reset() {
     riverCellLastSeen.fill(0);
     capillaryOrigins = [];
     prevCapillaryOriginKeys = new Set();
+    sleepCounter_arr.fill(0);
     init();
     console.log('Simulation reset.');
 }

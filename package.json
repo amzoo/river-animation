@@ -5,6 +5,6 @@
   "main": "server.js",
   "dependencies": {
     "simplex-noise": "2.4.0",
-    "ws": "^8.0.0"
+    "uWebSockets.js": "github:uNetworking/uWebSockets.js#v20.46.0"
   }
 }

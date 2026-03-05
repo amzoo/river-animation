@@ -4,7 +4,7 @@
 // Unit 4: Worker thread isolation — sim runs in sim-worker.js; this file only
 //         handles WebSocket connections and message routing.
 
-const { WebSocketServer } = require('ws');
+const uWS                  = require('uWebSockets.js');
 const { Worker }           = require('worker_threads');
 const zlib                 = require('node:zlib');
 const fs                   = require('fs');
@@ -67,20 +67,18 @@ worker.on('message', (msg) => {
     }
     if (msg.type === 'speed') {
         simSpeed = msg.speed;
-        const speedMsg = JSON.stringify({ type: 'sim_speed', speed: simSpeed });
-        for (const c of clients) if (c.readyState === c.OPEN) c.send(speedMsg);
+        broadcastText(JSON.stringify({ type: 'sim_speed', speed: simSpeed }));
         return;
     }
     if (msg.type === 'reset_ack') {
-        const ack = JSON.stringify({ type: 'reset_ack' });
-        for (const c of clients) if (c.readyState === c.OPEN) c.send(ack);
+        broadcastText(JSON.stringify({ type: 'reset_ack' }));
         return;
     }
-    if (clients.size === 0) return;
+    if (openSockets.size === 0) return;
     if (msg.type === 'frame') fpsFrameCount++;
     if (msg.type === 'frame' || msg.type === 'grid') {
         const raw = Buffer.from(msg.buf);
-        broadcastBinary(USE_ZSTD ? zlib.zstdCompressSync(raw, { level: 1 }) : raw);
+        broadcastFrame(USE_ZSTD ? zlib.zstdCompressSync(raw, { level: 1 }) : raw);
     }
 });
 
@@ -89,65 +87,93 @@ worker.on('exit', (code) => { if (code !== 0) console.error('Sim worker exited w
 
 // ---- WebSocket server ----
 
-const wss = new WebSocketServer({ port: PORT });
-const clients = new Set();
+const openSockets = new Set();
 let projectorWs = null;
 
 // FPS accounting (from worker frame messages)
 let fpsFrameCount = 0;
 let fpsStart = Date.now();
 
-// Re-use the same FPS interval for reporting
 setInterval(() => {
     const now = Date.now();
     if (now - fpsStart >= 1000) {
         const fps = (fpsFrameCount / ((now - fpsStart) / 1000)).toFixed(1);
-        if (clients.size > 0) {
-            const msg = JSON.stringify({ type: 'fps', fps: parseFloat(fps) });
-            for (const ws of clients) if (ws.readyState === ws.OPEN) ws.send(msg);
+        if (openSockets.size > 0) {
+            broadcastText(JSON.stringify({ type: 'fps', fps: parseFloat(fps) }));
         }
         fpsFrameCount = 0;
         fpsStart = now;
-        console.log(`FPS: ${fps}  Clients: ${clients.size}`);
+        console.log(`FPS: ${fps}  Clients: ${openSockets.size}`);
     }
 }, Math.round(1000 / TARGET_FPS));
 
+function broadcastFrame(buf) {
+    openSockets.forEach(ws => {
+        const ud = ws.getUserData();
+        ud.frameCount++;
+        if (ud.frameCount % ud.frameSkip !== 0) return;
+        if (ws.getBufferedAmount() > 0) return; // backpressure: drop frame
+        ws.send(buf, true); // binary=true
+    });
+}
 
-function broadcastBinary(buf) {
-    for (const ws of clients) {
-        if (ws.readyState === ws.OPEN) ws.send(buf, { binary: true });
-    }
+function broadcastText(str) {
+    openSockets.forEach(ws => ws.send(str, false));
 }
 
 function sendCurrentState(ws) {
-    if (ws.readyState !== ws.OPEN) return;
-    ws.send(JSON.stringify({ type: 'display_transform', ...currentDisplayTransform }));
-    ws.send(JSON.stringify({ type: 'client_state', ...clientToggles }));
-    ws.send(JSON.stringify({ type: 'sim_speed', speed: simSpeed }));
+    ws.send(JSON.stringify({ type: 'display_transform', ...currentDisplayTransform }), false);
+    ws.send(JSON.stringify({ type: 'client_state', ...clientToggles }), false);
+    ws.send(JSON.stringify({ type: 'sim_speed', speed: simSpeed }), false);
     // Signal Zstd only if server is actually compressing
-    if (USE_ZSTD) ws.send(JSON.stringify({ type: 'encoding', compression: 'zstd' }));
+    if (USE_ZSTD) ws.send(JSON.stringify({ type: 'encoding', compression: 'zstd' }), false);
 }
 
-wss.on('connection', (ws) => {
-    clients.add(ws);
-    console.log(`Client connected. Total: ${clients.size}`);
-    sendCurrentState(ws);
+const app = uWS.App();
 
-    ws.on('message', (data, isBinary) => {
+app.ws('/*', {
+    compression: uWS.DISABLED,
+    maxPayloadLength: 16 * 1024 * 1024,
+    idleTimeout: 60,
+
+    upgrade: (res, req, context) => {
+        const url = req.getUrl();
+        const query = req.getQuery();
+        // Detect projector role from URL query param for initial frameSkip
+        const isProjectorUrl = /(?:^|&)role=projector(?:&|$)/.test(query);
+        res.upgrade(
+            { role: isProjectorUrl ? 'projector' : 'control', frameSkip: isProjectorUrl ? 1 : 6, frameCount: 0, isProjector: isProjectorUrl },
+            req.getHeader('sec-websocket-key'),
+            req.getHeader('sec-websocket-protocol'),
+            req.getHeader('sec-websocket-extensions'),
+            context
+        );
+    },
+
+    open: (ws) => {
+        openSockets.add(ws);
+        console.log(`Client connected. Total: ${openSockets.size}`);
+        sendCurrentState(ws);
+    },
+
+    message: (ws, message, isBinary) => {
         if (isBinary) return;
-        const str = data.toString();
+        const str = Buffer.from(message).toString();
         let msg = null;
         try { msg = JSON.parse(str); } catch (e) { /* not JSON */ }
 
         if (msg && msg.type === 'register') {
             if (msg.role === 'projector') {
-                if (projectorWs && projectorWs.readyState === projectorWs.OPEN) {
-                    ws.send(JSON.stringify({ type: 'error', reason: 'projector_taken' }));
+                if (projectorWs && openSockets.has(projectorWs)) {
+                    ws.send(JSON.stringify({ type: 'error', reason: 'projector_taken' }), false);
                     ws.close();
                     console.log('Rejected duplicate projector registration.');
                 } else {
                     projectorWs = ws;
-                    ws.send(JSON.stringify({ type: 'registered', role: 'projector' }));
+                    const ud = ws.getUserData();
+                    ud.role = 'projector';
+                    ud.frameSkip = 1;
+                    ws.send(JSON.stringify({ type: 'registered', role: 'projector' }), false);
                     console.log('Projector client registered.');
                 }
             }
@@ -158,7 +184,7 @@ wss.on('connection', (ws) => {
                 clientToggles[k] = !clientToggles[k];
                 saveState();
                 const echo = JSON.stringify({ type: 'client_key', key: msg.key });
-                for (const c of clients) if (c.readyState === c.OPEN) c.send(echo);
+                openSockets.forEach(c => c.send(echo, false));
             }
             // Speed updates are reported by the worker via the 'speed' message
         } else if (msg && msg.type === 'reset') {
@@ -171,38 +197,43 @@ wss.on('connection', (ws) => {
             const k = msg.key.toLowerCase();
             if (k in clientToggles) { clientToggles[k] = !clientToggles[k]; saveState(); }
             const fwd = JSON.stringify(msg);
-            for (const c of clients) if (c !== ws && c.readyState === c.OPEN) c.send(fwd);
+            openSockets.forEach(c => { if (c !== ws) c.send(fwd, false); });
         } else if (msg && msg.type === 'client_dimensions') {
             if (ws === projectorWs) {
                 const fwd = JSON.stringify(msg);
-                for (const c of clients) if (c !== ws && c.readyState === c.OPEN) c.send(fwd);
+                openSockets.forEach(c => { if (c !== ws) c.send(fwd, false); });
             }
         } else if (msg && msg.type === 'display_transform') {
             currentDisplayTransform = { ...currentDisplayTransform, ...msg };
             delete currentDisplayTransform.type;
             saveState();
             const fwd = JSON.stringify(msg);
-            for (const c of clients) if (c !== ws && c.readyState === c.OPEN) c.send(fwd);
+            openSockets.forEach(c => { if (c !== ws) c.send(fwd, false); });
         } else if (msg && msg.type === 'client_fps') {
             const fwd = JSON.stringify(msg);
-            for (const c of clients) if (c !== ws && c.readyState === c.OPEN) c.send(fwd);
+            openSockets.forEach(c => { if (c !== ws) c.send(fwd, false); });
         } else if (msg && msg.type === 'mouse') {
             worker.postMessage({ type: 'mouse', data: msg });
         } else if (!msg) {
             worker.postMessage({ type: 'key', key: str });
         }
-    });
+    },
 
-    ws.on('close', () => {
+    drain: (ws) => {
+        // socket drained — backpressure cleared
+    },
+
+    close: (ws, code, message) => {
         if (ws === projectorWs) {
             projectorWs = null;
             console.log('Projector client disconnected.');
         }
-        clients.delete(ws);
-        console.log(`Client disconnected. Total: ${clients.size}`);
-    });
-
-    ws.on('error', (err) => console.error('WS client error:', err.message));
+        openSockets.delete(ws);
+        console.log(`Client disconnected. Total: ${openSockets.size}`);
+    },
 });
 
-wss.on('error', (err) => console.error('WS server error:', err.message));
+app.listen(PORT, (token) => {
+    if (token) console.log(`WS listening on :${PORT}`);
+    else console.error('Failed to listen on port', PORT);
+});
